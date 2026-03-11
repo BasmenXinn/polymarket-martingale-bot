@@ -17,9 +17,10 @@ import { initClient } from './services/client.js';
 import { getUsdcBalance } from './services/client.js';
 import { initDashboard, appendLog, updateStatus, isDashboardActive } from './ui/dashboard.js';
 import { startSniperDetector, stopSniperDetector } from './services/sniperDetector.js';
-import { executeSnipe, getActiveSnipes } from './services/sniperExecutor.js';
-import { redeemSniperPositions } from './services/ctf.js';
+import { executeSnipe, getActiveSnipes, getConditionAsset } from './services/sniperExecutor.js';
+import { redeemSniperPositions, onSniperWin } from './services/ctf.js';
 import { getSchedule, isAssetInSession, getNextSessionInfo } from './services/schedule.js';
+import { getTimeMultiplier } from './services/sniperSizing.js';
 
 // ── Validate config ────────────────────────────────────────────────────────────
 
@@ -76,7 +77,20 @@ async function buildStatusContent() {
     lines.push(`  3-Tier : ${prices[0]}c/${prices[1]}c/${prices[2]}c`);
     lines.push(`  Sizes  : ${sizes[0]}/${sizes[1]}/${sizes[2]} shares`);
     const costPerSide = (sizes[0] * prices[0]) + (sizes[1] * prices[1]) + (sizes[2] * prices[2]);
-    lines.push(`  Cost   : $${(costPerSide * 2 * config.sniperAssets.length).toFixed(3)} per slot`);
+    lines.push(`  Cost   : $${(costPerSide * 2 * config.sniperAssets.length).toFixed(3)} per slot (base)`);
+    const { multiplier, label: mulLabel } = getTimeMultiplier();
+    if (config.sniperMultipliers.length > 0) {
+        lines.push(`  Mul    : ${mulLabel}`);
+    }
+    if (config.sniperPauseRoundsAfterWin > 0) {
+        lines.push(`  Pause  : ${config.sniperPauseRoundsAfterWin} rounds after win`);
+    }
+    // Show per-asset pause status
+    for (const a of config.sniperAssets) {
+        if (pauseCounters[a] > 0) {
+            lines.push(`  {yellow-fg}${a.toUpperCase()} paused (${pauseCounters[a]} rounds){/yellow-fg}`);
+        }
+    }
     lines.push('');
 
     // Session schedule
@@ -139,9 +153,47 @@ function startRedeemer() {
     logger.info(`Sniper redeemer started — checking every ${config.redeemInterval / 1000}s`);
 }
 
+// ── Pause-after-win tracking ─────────────────────────────────────────────────
+
+const pauseCounters = {};
+
+function handleWin(conditionId) {
+    const asset = getConditionAsset(conditionId);
+    if (!asset) return;
+    const rounds = config.sniperPauseRoundsAfterWin;
+    pauseCounters[asset] = rounds;
+    logger.success(`SNIPER: WIN on ${asset.toUpperCase()} — pausing ${rounds} rounds`);
+}
+
+function isAssetPaused(asset) {
+    const key = asset.toLowerCase();
+    return pauseCounters[key] > 0;
+}
+
+function tickPause(asset) {
+    const key = asset.toLowerCase();
+    if (pauseCounters[key] > 0) {
+        pauseCounters[key]--;
+        if (pauseCounters[key] <= 0) {
+            logger.info(`SNIPER: ${asset.toUpperCase()} pause ended — resuming`);
+        }
+    }
+}
+
+onSniperWin(handleWin);
+
 // ── Market handler ────────────────────────────────────────────────────────────
 
 async function handleNewMarket(market) {
+    const asset = market.asset.toLowerCase();
+
+    tickPause(asset);
+
+    if (isAssetPaused(asset)) {
+        logger.info(`SNIPER: ${asset.toUpperCase()} paused (${pauseCounters[asset]} rounds left) — skipping`);
+        return;
+    }
+
     executeSnipe(market).catch((err) =>
         logger.error(`SNIPER execute error (${market.asset}): ${err.message}`)
     );

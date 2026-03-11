@@ -4,19 +4,27 @@
  *   - Tier 1: 3c price, smallest size (20% of max)
  *   - Tier 2: 2c price, medium size (30% of max)
  *   - Tier 3: 1c price, largest size (50% of max)
- *   Min 5 shares per tier, total = SNIPER_MAX_SHARES
+ *   Min 5 shares per tier, total = SNIPER_MAX_SHARES × timeMultiplier
  */
 
 import { Side, OrderType } from '@polymarket/clob-client';
 import config from '../config/index.js';
 import { getClient } from './client.js';
 import logger from '../utils/logger.js';
+import { getTimeMultiplier } from './sniperSizing.js';
 
 // In-memory tracking of placed snipe orders
 const activeSnipes = [];
 
+// conditionId → asset mapping (for win detection → pause linkage)
+const conditionAssetMap = new Map();
+
 export function getActiveSnipes() {
     return [...activeSnipes];
+}
+
+export function getConditionAsset(conditionId) {
+    return conditionAssetMap.get(conditionId) || null;
 }
 
 /**
@@ -48,15 +56,26 @@ export async function executeSnipe(market) {
     const label = question.slice(0, 40);
     const sim   = config.dryRun ? '[SIM] ' : '';
 
+    // Track conditionId → asset for win detection
+    conditionAssetMap.set(conditionId, asset.toLowerCase());
+
     const sides = [
         { name: 'UP',   tokenId: yesTokenId },
         { name: 'DOWN', tokenId: noTokenId  },
     ];
 
-    const prices = config.sniperTierPrices;
-    const sizes = calculateTierSizes(config.sniperMaxShares, config.sniperMinSharesPerTier);
+    // Apply time-based multiplier
+    const { multiplier, label: mulLabel } = getTimeMultiplier();
+    const effectiveMaxShares = Math.max(
+        config.sniperMinSharesPerTier * 3,
+        Math.round(config.sniperMaxShares * multiplier),
+    );
 
-    logger.info(`SNIPER: ${sim}${asset.toUpperCase()} — "${label}" | 3-tier: 3c×${sizes[0]} | 2c×${sizes[1]} | 1c×${sizes[2]}`);
+    const prices = config.sniperTierPrices;
+    const sizes = calculateTierSizes(effectiveMaxShares, config.sniperMinSharesPerTier);
+
+    const mulInfo = multiplier !== 1.0 ? ` | mul ${mulLabel}` : '';
+    logger.info(`SNIPER: ${sim}${asset.toUpperCase()} — "${label}" | 3-tier: 3c×${sizes[0]} | 2c×${sizes[1]} | 1c×${sizes[2]}${mulInfo}`);
 
     for (const { name, tokenId } of sides) {
         // Place 3 orders per side

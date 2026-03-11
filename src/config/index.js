@@ -88,6 +88,24 @@ const config = {
   sniperMaxShares: parseFloat(process.env.SNIPER_MAX_SHARES || '15'), // max total per side
   sniperMinSharesPerTier: 5, // minimum shares for each tier
 
+  // ── Sniper Sizing Multiplier (UTC+8) ──────────────────────────
+  // Time-based bet sizing multiplier. Format: HH:MM-HH:MM:factor,...
+  // Example: SNIPER_MULTIPLIERS=21:00-00:00:1.41,06:00-12:00:0.85
+  // Default multiplier outside any window = 1.0
+  sniperMultipliers: (() => {
+    const raw = process.env.SNIPER_MULTIPLIERS || '';
+    if (!raw.trim()) return [];
+    return raw.split(',').map((s) => s.trim()).filter(Boolean).map((entry) => {
+      const m = entry.match(/^(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2}):(\d+\.?\d*)$/);
+      if (!m) return null;
+      return { start: m[1], end: m[2], multiplier: parseFloat(m[3]) };
+    }).filter(Boolean);
+  })(),
+
+  // ── Sniper Pause After Win ───────────────────────────────────
+  // Number of rounds (5-min slots) to pause an asset after a win is detected.
+  sniperPauseRoundsAfterWin: parseInt(process.env.SNIPER_PAUSE_ROUNDS_AFTER_WIN || '3', 10),
+
   // ── Sniper Schedule (UTC+8) ────────────────────────────────────
   // Per-asset session windows. Format: SNIPER_SCHEDULE_{ASSET}=HH:MM-HH:MM,HH:MM-HH:MM
   // Assets without a schedule are always active.

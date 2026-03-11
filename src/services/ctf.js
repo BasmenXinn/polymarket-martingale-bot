@@ -542,6 +542,17 @@ export async function redeemMMPositions() {
 const _failedConditions = new Set();
 const _skippedLosses = new Set();
 
+// Callback invoked when a win is detected — receives conditionId
+let _onWinCallback = null;
+
+/**
+ * Register a callback to be called when a sniper win is detected.
+ * Callback signature: (conditionId: string) => void
+ */
+export function onSniperWin(cb) {
+    _onWinCallback = cb;
+}
+
 /**
  * Redeem sniper positions via Gnosis Safe.
  * Only redeems WINNING positions — skip losses (they can be manually cleared).
@@ -616,37 +627,46 @@ export async function redeemSniperPositions() {
                 continue;
             }
 
-            // Estimate payout from numerators (for logging)
-            const payoutFractions = await Promise.all(
+            // Check outcome via payoutNumerators — which outcome index won?
+            const payoutNums = await Promise.all(
                 [0, 1].map((i) =>
-                    ctf.payoutNumerators(conditionId, i)
-                        .then((n) => n.toNumber() / denominator.toNumber())
+                    ctf.payoutNumerators(conditionId, i).then((n) => n.toNumber())
                 )
             );
+            const denom = denominator.toNumber();
+            const payoutFractions = payoutNums.map((n) => n / denom);
+
+            // Determine winning outcome index (the one with payoutFraction > 0)
+            const winningOutcome = payoutFractions[0] > 0 ? 0 : payoutFractions[1] > 0 ? 1 : -1;
+
+            // Win = we hold shares on the winning outcome side
+            const isWin = winningOutcome >= 0 && balances[winningOutcome] > 0;
             const expectedUsdc = balances.reduce(
                 (sum, shares, i) => sum + shares * (payoutFractions[i] ?? 0), 0
             );
 
             const label = conditionId.slice(0, 12) + '...';
-            const isWin = expectedUsdc >= 0.01;
 
             // SNIPER: only redeem WINNERS — cache losses to skip next time
             if (!isWin) {
                 _skippedLosses.add(conditionId);
                 if (config.dryRun) {
-                    logger.info(`SNIPER[SIM] skip loss: ${label} — ${totalShares.toFixed(3)} shares (cached, no future checks)`);
+                    logger.info(`SNIPER[SIM] skip loss: ${label} — ${totalShares.toFixed(3)} shares, outcome=${winningOutcome} (cached)`);
                 } else {
-                    logger.info(`SNIPER redeemer: skip loss ${label} — cached for future cycles`);
+                    logger.info(`SNIPER redeemer: skip loss ${label} — outcome=${winningOutcome}, no shares on winner`);
                 }
                 continue;
             }
 
+            // Track win for pause-after-win (notify via callback)
+            if (_onWinCallback) _onWinCallback(conditionId);
+
             if (config.dryRun) {
-                logger.money(`SNIPER[SIM] redeem: ${label} — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC (WIN)`);
+                logger.money(`SNIPER[SIM] redeem: ${label} — ${balances[winningOutcome].toFixed(3)} shares on outcome ${winningOutcome} → ~$${expectedUsdc.toFixed(2)} USDC (WIN)`);
                 continue;
             }
 
-            logger.info(`SNIPER redeemer: ${label} resolved WIN — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC`);
+            logger.info(`SNIPER redeemer: ${label} resolved WIN — outcome ${winningOutcome}, ${balances[winningOutcome].toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC`);
 
             // Call redeemPositions through Safe — winners only
             const data = ctfIface.encodeFunctionData('redeemPositions', [
