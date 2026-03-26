@@ -67,6 +67,14 @@ const config = {
   mmAdaptiveMinCombined: parseFloat(process.env.MM_ADAPTIVE_MIN_COMBINED || '1.20'), // min combined sell (both legs) to qualify for limit
   mmAdaptiveMonitorSec: parseInt(process.env.MM_ADAPTIVE_MONITOR_SEC || '5', 10),
 
+  // ── Defensive Pivot (5m markets only) ─────────────────────────
+  // When NEITHER side fills within timeout, enter defensive mode:
+  // At 30s before close, if worst side < threshold → market sell worst, keep best
+  // Otherwise merge back to USDC (zero P&L)
+  mmDefensiveEnabled: process.env.MM_DEFENSIVE_ENABLED !== 'false',  // default on
+  mmDefensiveTimeout: parseInt(process.env.MM_DEFENSIVE_TIMEOUT || '120', 10),         // secs without fill → defensive
+  mmDefensiveWorstThreshold: parseFloat(process.env.MM_DEFENSIVE_WORST_THRESHOLD || '0.10'), // sell worst if price < this
+
   // ── Recovery Buy (after cut-loss) ─────────────────────────────
   // When enabled: after cutting loss, monitor prices for 10s and
   // market-buy the dominant side if it's above threshold and rising/stable.

@@ -229,6 +229,18 @@ async function monitorAndManage(pos) {
             break;
         }
 
+        // ── Defensive pivot: neither filled after timeout (5m markets only) ──
+        if (config.mmDefensiveEnabled && config.mmDuration === '5m'
+            && !pos.yes.filled && !pos.no.filled && !pos._defensiveActive) {
+            const elapsed = (Date.now() - new Date(pos.enteredAt).getTime()) / 1000;
+            if (elapsed >= config.mmDefensiveTimeout) {
+                pos._defensiveActive = true;
+                logger.warn(`MM: neither side filled after ${Math.round(elapsed)}s — entering defensive mode | ${label}`);
+                await defensivePivot(pos);
+                break;
+            }
+        }
+
         // ── Cut-loss time ────────────────────────────────────────────────────
         if (msRemaining <= config.mmCutLossTime * 1000) {
             logger.warn(`MM: cut-loss triggered (${Math.round(msRemaining / 1000)}s left) — ${label}`);
@@ -319,6 +331,106 @@ async function cutLossNeitherFilled(pos) {
 
     // Optional recovery buy (enabled via MM_RECOVERY_BUY=true)
     await attemptRecoveryBuy(pos);
+}
+
+// ── Defensive Pivot (5m markets, neither side filled) ────────────────────────
+
+/**
+ * Defensive pivot: neither side has filled after MM_DEFENSIVE_TIMEOUT.
+ *
+ * Strategy:
+ *   1. Cancel both limit sells, keep monitoring
+ *   2. Wait until 30s before close
+ *   3. Check prices: identify worst (lower price) and best (higher price) side
+ *   4. If worst < MM_DEFENSIVE_WORST_THRESHOLD (default 10c):
+ *        → market sell worst side, keep best side (let it resolve at close)
+ *        → since YES+NO ≈ $1, best side is ~90c+ → profit potential
+ *   5. If worst ≥ threshold: market is still uncertain → merge back ($0 P&L)
+ */
+async function defensivePivot(pos) {
+    const { conditionId, tickSize, negRisk } = pos;
+    const label = pos.question.substring(0, 40);
+    const threshold = config.mmDefensiveWorstThreshold;
+
+    // Cancel both limit sells immediately — we'll decide at 30s mark
+    await cancelOrder(pos.yes.orderId);
+    await cancelOrder(pos.no.orderId);
+    logger.info(`MM defensive: cancelled both limit sells — waiting for 30s before close | ${label}`);
+
+    // Wait until 30s before close, checking every 5s if one side fills via partial
+    while (true) {
+        const msLeft = new Date(pos.endTime).getTime() - Date.now();
+
+        if (msLeft <= 30_000) break; // 30s mark reached
+        if (msLeft <= 0) {
+            pos.status = 'expired';
+            return;
+        }
+
+        await sleep(5000);
+    }
+
+    // Read current prices for both sides
+    const [yesPrice, noPrice] = await Promise.all([
+        getMidprice(pos.yes.tokenId),
+        getMidprice(pos.no.tokenId),
+    ]);
+
+    logger.info(`MM defensive: 30s mark — YES=$${yesPrice.toFixed(3)}, NO=$${noPrice.toFixed(3)} | threshold=$${threshold} | ${label}`);
+
+    // Determine worst and best sides
+    const worstKey = yesPrice <= noPrice ? 'yes' : 'no';
+    const bestKey  = worstKey === 'yes' ? 'no' : 'yes';
+    const worstPrice = Math.min(yesPrice, noPrice);
+    const bestPrice  = Math.max(yesPrice, noPrice);
+
+    // ── Decision: pivot or merge? ─────────────────────────────────────────
+    if (worstPrice < threshold) {
+        // Worst side < 10c → market is decisive, pivot!
+        logger.trade(`MM defensive: worst side ${worstKey.toUpperCase()} @ $${worstPrice.toFixed(3)} < $${threshold} — selling worst, keeping ${bestKey.toUpperCase()} @ $${bestPrice.toFixed(3)}`);
+
+        const worstSide = pos[worstKey];
+        const bestSide  = pos[bestKey];
+
+        // Get actual on-chain balances
+        const [worstBalance, bestBalance] = await Promise.all([
+            getTokenBalance(worstSide.tokenId),
+            getTokenBalance(bestSide.tokenId),
+        ]);
+        const worstShares = worstBalance !== null ? worstBalance : worstSide.shares;
+        const bestShares  = bestBalance !== null ? bestBalance : bestSide.shares;
+
+        // Market sell worst side
+        if (worstShares >= 0.001) {
+            const result = await marketSell(worstSide.tokenId, worstShares, tickSize, negRisk);
+            worstSide.fillPrice = result.fillPrice;
+            worstSide.filled = true;
+            logger.warn(`MM defensive: sold ${worstKey.toUpperCase()} ${worstShares.toFixed(3)} sh @ $${result.fillPrice.toFixed(3)}`);
+        } else {
+            worstSide.fillPrice = 0;
+            worstSide.filled = true;
+        }
+
+        // Best side: let it resolve at market close (hold the tokens)
+        // The market will resolve and we can redeem via the redeemer
+        // Best side price is ~90c+ so payout ≈ $1 per share if it wins
+        logger.money(`MM defensive: holding ${bestKey.toUpperCase()} ${bestShares.toFixed(3)} sh @ ~$${bestPrice.toFixed(3)} — waiting for resolution`);
+        logger.info(`MM defensive: expected payout if ${bestKey.toUpperCase()} wins: ~$${bestShares.toFixed(2)} | cost was $${(bestSide.entryPrice * bestShares).toFixed(2)}`);
+
+        // Mark best side as filled at entry price for now — actual payout handled by redeemer
+        bestSide.fillPrice = bestSide.entryPrice;
+        bestSide.filled = true;
+        pos.status = 'done';
+
+        const worstPnl = worstSide.fillPrice
+            ? (worstSide.fillPrice - worstSide.entryPrice) * worstShares
+            : 0;
+        logger.info(`MM defensive: worst side P&L: $${worstPnl.toFixed(2)} | best side will be redeemed after resolution`);
+    } else {
+        // Worst side ≥ 10c → market uncertain, safer to merge
+        logger.info(`MM defensive: worst side ${worstKey.toUpperCase()} @ $${worstPrice.toFixed(3)} ≥ $${threshold} — market uncertain, merging back to USDC`);
+        await cutLossNeitherFilled(pos);
+    }
 }
 
 async function adaptiveLegCL(pos, unfilledKey) {
