@@ -86,6 +86,7 @@ export async function proxyFetch(url, opts = {}) {
  */
 async function checkOutboundIP() {
     const IP_SERVICE = 'https://api.ipify.org?format=json';
+    const GEOBLOCK_API = 'https://polymarket.com/api/geoblock';
 
     // 1. Check VPS direct IP
     try {
@@ -98,7 +99,22 @@ async function checkOutboundIP() {
         logger.warn('Could not detect VPS direct IP');
     }
 
-    // 2. Check proxied IP (what Polymarket will see)
+    // 2. Check if VPS direct IP is geoblocked
+    try {
+        const geoResp = await fetch(GEOBLOCK_API, { signal: AbortSignal.timeout(10000) });
+        if (geoResp.ok) {
+            const geo = await geoResp.json();
+            if (geo.blocked) {
+                logger.warn(`VPS direct IP GEOBLOCKED — country: ${geo.country}, region: ${geo.region}`);
+            } else {
+                logger.info(`VPS direct IP NOT geoblocked — country: ${geo.country}`);
+            }
+        }
+    } catch {
+        logger.warn('Could not check VPS geoblock status');
+    }
+
+    // 3. Check proxied IP (what Polymarket will see)
     if (fetchDispatcher) {
         try {
             const proxyResp = await fetch(IP_SERVICE, {
@@ -111,6 +127,28 @@ async function checkOutboundIP() {
             }
         } catch {
             logger.warn('Could not detect proxy IP — proxy may not be working');
+        }
+
+        // 4. Check if proxy IP is geoblocked
+        try {
+            const geoResp = await fetch(GEOBLOCK_API, {
+                dispatcher: fetchDispatcher,
+                signal: AbortSignal.timeout(10000),
+            });
+            if (geoResp.ok) {
+                const geo = await geoResp.json();
+                if (geo.blocked) {
+                    logger.error('═══════════════════════════════════════════════════');
+                    logger.error(`PROXY IP GEOBLOCKED by Polymarket!`);
+                    logger.error(`IP: ${geo.ip} | Country: ${geo.country} | Region: ${geo.region}`);
+                    logger.error('Change PROXY_URL in .env to a proxy in an allowed region.');
+                    logger.error('═══════════════════════════════════════════════════');
+                } else {
+                    logger.success(`Proxy IP NOT geoblocked — country: ${geo.country} ✓`);
+                }
+            }
+        } catch {
+            logger.warn('Could not check proxy geoblock status');
         }
     }
 }
