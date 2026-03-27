@@ -110,22 +110,37 @@ async function marketSell(tokenId, shares, tickSize, negRisk) {
 
 // ── Order status check ────────────────────────────────────────────────────────
 
-async function isOrderFilled(orderId, shares) {
+async function isOrderFilled(orderId, shares, tokenId = null) {
     if (!orderId || orderId.startsWith('sim-')) return false;
     const MAX_FILL_RETRIES = 2;
     for (let attempt = 1; attempt <= MAX_FILL_RETRIES; attempt++) {
         try {
             const client = getClient();
             const order = await client.getOrder(orderId);
-            if (!order) return false;
+            if (!order) break; // order gone — fall through to balance check
             if (order.status === 'MATCHED') return true;
             const matched = parseFloat(order.size_matched || '0');
-            return matched >= shares * 0.99;
+            if (matched >= shares * 0.99) return true;
+            // CLOB says not filled — trust it if we have no tokenId for balance check
+            if (!tokenId) return false;
+            // Otherwise fall through to balance check below
+            break;
         } catch (err) {
-            logger.warn(`MM: isOrderFilled error (attempt ${attempt}/${MAX_FILL_RETRIES}): ${err.message}`);
+            logger.warn(`MM: isOrderFilled CLOB error (attempt ${attempt}/${MAX_FILL_RETRIES}): ${err.message}`);
             if (attempt < MAX_FILL_RETRIES) await sleep(2000);
         }
     }
+
+    // Fallback: check on-chain token balance
+    // If we placed a SELL and our balance is now ~0, the order was filled
+    if (tokenId) {
+        const balance = await getTokenBalance(tokenId);
+        if (balance !== null && balance < shares * 0.05) {
+            logger.warn(`MM: CLOB API missed fill — on-chain balance ${balance.toFixed(3)} ≈ 0 (expected ${shares}) → treating as filled`);
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -187,7 +202,7 @@ async function monitorAndManage(pos) {
                 const hitPrice = await simPriceHitTarget(pos.yes.tokenId);
                 if (hitPrice) { filled = true; pos.yes.fillPrice = hitPrice; }
             } else {
-                filled = await isOrderFilled(pos.yes.orderId, pos.yes.shares);
+                filled = await isOrderFilled(pos.yes.orderId, pos.yes.shares, pos.yes.tokenId);
                 if (filled) pos.yes.fillPrice = config.mmSellPrice;
             }
             if (filled) {
@@ -204,7 +219,7 @@ async function monitorAndManage(pos) {
                 const hitPrice = await simPriceHitTarget(pos.no.tokenId);
                 if (hitPrice) { filled = true; pos.no.fillPrice = hitPrice; }
             } else {
-                filled = await isOrderFilled(pos.no.orderId, pos.no.shares);
+                filled = await isOrderFilled(pos.no.orderId, pos.no.shares, pos.no.tokenId);
                 if (filled) pos.no.fillPrice = config.mmSellPrice;
             }
             if (filled) {
@@ -579,7 +594,7 @@ async function adaptiveLegCL(pos, unfilledKey) {
                 const hitPrice = await simPriceHitTarget(s.tokenId);
                 if (hitPrice) { filled = true; s.fillPrice = hitPrice; }
             } else {
-                filled = await isOrderFilled(activeOrderId, sellShares);
+                filled = await isOrderFilled(activeOrderId, sellShares, s.tokenId);
                 if (filled) s.fillPrice = activeLimitPrice;
             }
 
