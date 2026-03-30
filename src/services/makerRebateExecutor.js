@@ -337,12 +337,14 @@ async function monitorUntilFilled(pos, tag, label) {
     // Side filter removed: RTDS may report side from taker perspective (SELL),
     // not our maker perspective. We're already gated by proxyWallet + tokenId.
     const onWsFill = (event) => {
+        // WS is used only as a wake-up signal — do NOT set pos.filled here.
+        // Setting filled=true from WS on a partial fill (e.g. 2 of 5 shares) would
+        // make the loop think the side is done and skip the onchain balance check,
+        // leaving the position stuck. Onchain balance is the sole source of truth.
         if (event.tokenId === pos.yes.tokenId) {
-            pos.yes.filled = true;
             logger.money(`MakerMM${tag}: YES fill signal (WS) ${event.size?.toFixed(2) || '?'} @ $${event.price?.toFixed(3) || pos.yes.buyPrice.toFixed(3)}`);
         }
         if (event.tokenId === pos.no.tokenId) {
-            pos.no.filled = true;
             logger.money(`MakerMM${tag}: NO fill signal (WS) ${event.size?.toFixed(2) || '?'} @ $${event.price?.toFixed(3) || pos.no.buyPrice.toFixed(3)}`);
         }
     };
