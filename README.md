@@ -1,314 +1,146 @@
 # Polymarket Terminal
 
-> An automated trading terminal for [Polymarket](https://polymarket.com) — copy trades, provide liquidity, and snipe low-priced orderbook fills, all from your command line.
+An open-source automated trading terminal for [Polymarket](https://polymarket.com) — featuring a high-frequency maker rebate market maker, copy trading, and an orderbook sniper, all runnable from the command line.
 
 **Created by [@direkturcrypto](https://twitter.com/direkturcrypto)**
+**Repository:** https://github.com/direkturcrypto/polymarket-terminal
 
 ---
 
-## Table of Contents
+## Strategies
 
-- [Features](#features)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Running on VPS with PM2](#running-on-vps-with-pm2)
-- [How It Works](#how-it-works)
-- [Project Structure](#project-structure)
-- [Important Warnings](#important-warnings)
-- [License](#license)
+### 1. Maker Rebate MM (`npm run maker-mm-bot`) ⭐ Main Strategy
 
----
+High-frequency market-making on Polymarket's 15-minute BTC/ETH/SOL Up-or-Down markets.
 
-## Features
+**How it works:**
+1. Detects a new 15-minute market as it opens
+2. Places maker limit BUY orders on both YES and NO sides simultaneously (combined ≈ $0.98)
+3. When both sides fill, merges YES + NO tokens back to USDC via the CTF contract — capturing the spread as profit
+4. Re-enters immediately after each successful merge for the duration of the market
+5. Automatically queues the next market before the current one closes — zero idle time between markets
 
-### Copy Trade Bot
-- **Watch Trader** — Monitor any Polymarket wallet address in real time via WebSocket
-- **Copy Buy** — Automatically mirror buy orders with configurable position sizing
-- **Copy Sell** — Automatically mirror sell orders (market or limit)
-- **Auto Sell** — Place a GTC limit sell at a target profit % immediately after a buy fills
-- **Auto Redeem** — Periodically check and redeem winning positions on-chain
-- **Market Expiry Guard** — Skip buys if market closes within `MIN_MARKET_TIME_LEFT` seconds
-- **GTC Fallback** — Falls back to a GTC limit order when copying "next market" trades with no liquidity
-- **Per-Market Queue** — Concurrent events for the same market are serialized to prevent duplicate buys
-- **Dry Run Mode** — Simulate the full flow without placing real orders
+**Key design decisions:**
+- **Never aggressive-reprices when one side is filled** — holds the original bid and waits for market reversion, preventing double exposure
+- **Stops re-entry after a stuck (one-sided) cycle** — protects against accumulating directional exposure in trending markets
+- **Combined cap always enforced** — cost of YES + NO never exceeds `MAKER_MM_MAX_COMBINED`, guaranteeing profitability on every successful merge
+- **WebSocket real-time fill detection** — fills detected via RTDS WebSocket for sub-second response, with onchain balance as source of truth
+- **Market-neutral** — profits from spread capture only, never depends on price direction
 
-### Market Maker Bot
-- **Automated Liquidity** — Splits USDC into YES+NO tokens and places limit sells on both sides at $0.50 entry
-- **Cut-Loss Protection** — Merges unsold tokens back to USDC before market close
-- **Recovery Buy** — Optional directional bet after a cut-loss triggers
-- **Multi-Asset** — Supports BTC, ETH, SOL, and any 5m/15m Polymarket market
-- **Simulation Mode** — Full dry-run with P&L tracking
+**Economics per cycle (default $5/side, 5 shares):**
+```
+Both sides fill → merge → recover $5.00 from $4.90 cost = +$0.10 profit per cycle
+One side stuck  → hold original bid → wait for reversion or cut-loss at close
+```
 
-### Orderbook Sniper Bot
-- **3-Tier Strategy** — Places GTC BUY orders at 3c, 2c, and 1c with weighted sizing (20%/30%/50%)
-- **Multi-Asset** — Targets ETH, SOL, XRP, and more simultaneously
-- **Simulation Mode** — Preview orders without spending funds
-- **Session Scheduling** — Per-asset time windows (UTC+8) for selective trading
+**Configuration (via `.env`):**
+```
+MAKER_MM_ASSETS=btc          # Assets: btc, eth, sol, xrp
+MAKER_MM_DURATION=15m        # Market duration
+MAKER_MM_TRADE_SIZE=5        # Shares per side
+MAKER_MM_MAX_COMBINED=0.98   # Max combined bid (controls spread profit)
+MAKER_MM_REENTRY_DELAY=30    # Seconds between cycles
+CURRENT_MARKET_ENABLED=true  # Allow entering mid-market
+CURRENT_MARKET_MAX_ODDS=0.70 # Skip if market is more skewed than this
+```
 
 ---
 
-## Prerequisites
+### 2. Copy Trader (`npm run bot`)
 
-| Requirement | Details |
-|---|---|
-| Node.js | v18 or higher (ESM support required) |
-| Polygon Wallet | An EOA wallet with a private key |
-| Polymarket Proxy Wallet | Your proxy wallet address (visible on your Polymarket profile → Deposit) |
-| USDC.e on Polygon | Deposited via Polymarket's deposit flow |
-| MATIC on Polygon | A small amount for gas fees (redeem & on-chain operations) |
-| PM2 *(optional)* | For running on a VPS: `npm install -g pm2` |
+Mirrors the trades of any target Polymarket wallet in real-time.
+
+- Monitors target wallet for new BUY/SELL activity via the CLOB API
+- Replicates trades proportionally using configurable sizing modes (`balance` or `percentage`)
+- Supports automatic sell-out when target trader exits (market or limit)
+- Auto-redeems resolved positions
+
+```
+TRADER_ADDRESS=0xTARGET_WALLET
+SIZE_MODE=balance
+SIZE_PERCENT=10
+MAX_POSITION_SIZE=10
+```
+
+---
+
+### 3. Orderbook Sniper (`npm run sniper`)
+
+Places 3-tier GTC limit BUY orders at deep discount price levels to catch panic dumps.
+
+- Deploys staggered orders at 3 price tiers (1¢, 2¢, 3¢) with weighted sizing (50% / 30% / 20%)
+- Time-based sizing multipliers for peak trading hours
+- Per-asset session schedules (UTC+8)
+- Auto-pauses an asset after a win to avoid re-entering an already-resolved market
+
+```
+SNIPER_ASSETS=eth,sol,xrp
+SNIPER_MAX_SHARES=15
+SNIPER_MULTIPLIERS=21:00-00:00:1.41,06:00-12:00:0.85
+```
+
+---
+
+## Requirements
+
+- Node.js 18+
+- A Polymarket account with a funded proxy wallet (USDC.e on Polygon)
+- EOA private key for signing (the signing wallet does not need to hold funds)
 
 ---
 
 ## Installation
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/direkturcrypto/polymarket-terminal.git
 cd polymarket-terminal
-
-# 2. Install dependencies
 npm install
-
-# 3. Copy the environment template
 cp .env.example .env
-
-# 4. Fill in your credentials
-nano .env
+# Edit .env with your wallet keys and settings
 ```
 
 ---
 
-## Configuration
+## Quick Start
 
-All settings are controlled via the `.env` file. **Never commit your `.env` file** — it is already listed in `.gitignore`.
-
-### Wallet Setup
-
-| Variable | Description | Required |
-|---|---|---|
-| `PRIVATE_KEY` | Your EOA private key (signing only, does not hold USDC) | Yes |
-| `PROXY_WALLET_ADDRESS` | Your Polymarket proxy wallet address | Yes |
-| `POLYGON_RPC_URL` | Polygon JSON-RPC endpoint | Yes |
-
-> **How to find your Proxy Wallet:** Log in to polymarket.com → click your profile → Deposit → copy the wallet address shown.
-
-### Polymarket API Credentials (Optional)
-
-Leave these blank to have the client auto-derive credentials from your private key.
-
-| Variable | Description |
-|---|---|
-| `CLOB_API_KEY` | CLOB API key |
-| `CLOB_API_SECRET` | CLOB API secret |
-| `CLOB_API_PASSPHRASE` | CLOB API passphrase |
-
-### Copy Trade Bot Settings
-
-| Variable | Description | Default |
-|---|---|---|
-| `TRADER_ADDRESS` | Proxy wallet address of the trader to copy | (required) |
-| `SIZE_MODE` | `percentage` (of `MAX_POSITION_SIZE`) or `balance` (of your USDC balance) | `balance` |
-| `SIZE_PERCENT` | Percentage to use per trade | `10` |
-| `MIN_TRADE_SIZE` | Minimum trade size in USDC (skip if below) | `1` |
-| `MAX_POSITION_SIZE` | Maximum USDC per market position | `10` |
-| `AUTO_SELL_ENABLED` | Place a limit sell after each buy fills | `true` |
-| `AUTO_SELL_PROFIT_PERCENT` | Target profit % for the auto-sell limit order | `10` |
-| `SELL_MODE` | `market` or `limit` when copying a sell | `market` |
-| `REDEEM_INTERVAL` | Seconds between redemption checks | `60` |
-| `MIN_MARKET_TIME_LEFT` | Skip buy if market closes within this many seconds | `300` |
-| `GTC_FALLBACK_TIMEOUT` | Seconds to wait for GTC fill when FAK finds no liquidity | `60` |
-| `DRY_RUN` | Simulate without placing real orders | `true` |
-
-### Market Maker Bot Settings
-
-| Variable | Description | Default |
-|---|---|---|
-| `MM_ASSETS` | Comma-separated assets to market-make (e.g. `btc,eth`) | `btc` |
-| `MM_DURATION` | Market duration: `5m` or `15m` | `5m` |
-| `MM_TRADE_SIZE` | USDC per side (total exposure = 2×) | `5` |
-| `MM_SELL_PRICE` | Limit sell price target (e.g. `0.60`) | `0.60` |
-| `MM_CUT_LOSS_TIME` | Seconds before close to trigger cut-loss | `60` |
-| `MM_MARKET_KEYWORD` | Keyword to filter market questions | `Bitcoin Up or Down` |
-| `MM_ENTRY_WINDOW` | Max seconds after open to enter (0 = open only) | `45` |
-| `MM_POLL_INTERVAL` | Seconds between new market polls | `10` |
-| `MM_RECOVERY_BUY` | Enable recovery buy after cut-loss | `false` |
-| `MM_RECOVERY_THRESHOLD` | Minimum dominant-side price to qualify for recovery | `0.70` |
-| `MM_RECOVERY_SIZE` | USDC for recovery buy (0 = use `MM_TRADE_SIZE`) | `0` |
-
-### Orderbook Sniper Settings
-
-**3-Tier Strategy:** Places orders at 3 price levels with weighted sizing
-
-| Variable | Description | Default |
-|---|---|---|
-| `SNIPER_ASSETS` | Comma-separated assets to snipe (e.g. `eth,sol,xrp`) | `eth,sol,xrp` |
-| `SNIPER_TIER1_PRICE` | Highest price tier (e.g. `0.03` = 3c) | `0.03` |
-| `SNIPER_TIER2_PRICE` | Mid price tier (e.g. `0.02` = 2c) | `0.02` |
-| `SNIPER_TIER3_PRICE` | Lowest price tier (e.g. `0.01` = 1c) | `0.01` |
-| `SNIPER_MAX_SHARES` | Max total shares per side (min 5 per tier) | `15` |
-
-**Allocation:**
-- Tier 1 (3c): 20% of max shares (min 5)
-- Tier 2 (2c): 30% of max shares (min 5)
-- Tier 3 (1c): 50% of max shares (min 5)
-
-**Example with `SNIPER_MAX_SHARES=15`:**
-- 3 shares @ 3c = $0.09
-- 5 shares @ 2c = $0.10
-- 7 shares @ 1c = $0.07
-- **Total per side:** 15 shares = $0.26
-
----
-
-## Usage
-
-### Terminal UI (local)
-
-Runs with an interactive split-panel dashboard (blessed TUI).
+**Always test with simulation mode first:**
 
 ```bash
-# Copy Trade Bot
-npm start           # live trading
-npm run dev         # live + auto-reload on file changes
+# Simulate maker MM — no real orders placed
+npm run maker-mm-bot-sim
 
-# Market Maker Bot
-npm run mm          # live trading
-npm run mm-sim      # simulation (DRY_RUN=true)
-npm run mm-dev      # simulation + auto-reload
+# Run live maker MM (recommended starting config)
+MAKER_MM_TRADE_SIZE=5 MAKER_MM_REENTRY_DELAY=30 npm run maker-mm-bot
 
-# Orderbook Sniper Bot
-npm run sniper      # live trading
-npm run sniper-sim  # simulation
-npm run sniper-dev  # simulation + auto-reload
+# Simulate copy trader
+npm run bot-sim
+
+# Run live copy trader
+npm run bot
+
+# Simulate orderbook sniper
+npm run sniper-sim
+
+# Run live sniper
+npm run sniper
 ```
-
-### Plain Log Mode (no TUI)
-
-Writes plain timestamped text to stdout — suitable for piping, `tail -f`, or PM2.
-
-```bash
-# Copy Trade Bot
-npm run bot         # live trading
-npm run bot-sim     # simulation
-npm run bot-dev     # simulation + auto-reload
-
-# Market Maker Bot
-npm run mm-bot      # live trading
-npm run mm-bot-sim  # simulation
-npm run mm-bot-dev  # simulation + auto-reload
-```
-
-> **Always test with `DRY_RUN=true` (or `*-sim` scripts) first** before committing real funds.
 
 ---
 
-## Running on VPS with PM2
-
-Each bot has its own PM2 config file inside the `pm2/` folder.
-
-### Install PM2
+## Running with PM2 (recommended for VPS)
 
 ```bash
 npm install -g pm2
-```
 
-### Copy Trade Bot
+# Start maker MM
+pm2 start src/maker-mm-bot.js --name polymarket-maker-mm --interpreter node
 
-```bash
-# Live trading
-pm2 start pm2/copy.config.cjs
-
-# Simulation
-pm2 start pm2/copy.config.cjs --env sim
+# Start copy trader
+pm2 start src/bot.js --name polymarket-bot --interpreter node
 
 # View logs
-pm2 logs polymarket-copy
-tail -f logs/copy-out.log
-
-# Management
-pm2 restart polymarket-copy
-pm2 stop polymarket-copy
-pm2 delete polymarket-copy
-```
-
-### Market Maker Bot
-
-```bash
-# Live trading
-pm2 start pm2/mm.config.cjs
-
-# Simulation
-pm2 start pm2/mm.config.cjs --env sim
-
-# View logs
-pm2 logs polymarket-mm
-tail -f logs/mm-out.log
-
-# Management
-pm2 restart polymarket-mm
-pm2 stop polymarket-mm
-pm2 delete polymarket-mm
-```
-
-### Auto-start on reboot
-
-```bash
-pm2 startup        # generates a startup command — run the command it prints
-pm2 save           # saves current process list
-```
-
----
-
-## How It Works
-
-### Copy Trade Bot Flow
-
-```
-WebSocket (RTDS) — real-time trade events from trader
-        │
-        ▼
-Per-market queue (prevents concurrent duplicate buys)
-        │
-   ┌────┴──────┐
-   │           │
-  BUY         SELL
-   │           │
-   ├─ Expiry guard (MIN_MARKET_TIME_LEFT)
-   ├─ Max position cap          ├─ Cancel open orders
-   ├─ FAK market buy            ├─ Reconcile on-chain balance
-   │  └─ 0 fill? → GTC fallback ├─ FAK market sell / limit sell
-   ├─ Place auto-sell GTC       └─ Remove position
-   └─ Save position
-        │
-        ▼
-Redeemer loop (every REDEEM_INTERVAL seconds)
-  → Check on-chain payout → redeemPositions via Gnosis Safe
-```
-
-### Market Maker Flow
-
-```
-New Market Detected
-        │
-        ▼
-Split USDC → YES + NO tokens ($0.50 each, zero slippage)
-        │
-        ▼
-Place limit SELL on both sides at MM_SELL_PRICE
-        │
-        ▼
-Monitor fills every few seconds
-        │
-   ┌────┴────┐
-   │         │
- Fill    Time < MM_CUT_LOSS_TIME
-   │         │
-   ▼         ▼
-Collect  Cancel orders → Merge YES+NO back to USDC
- profit    (recovery buy optional)
+pm2 logs polymarket-maker-mm
+pm2 logs polymarket-bot
 ```
 
 ---
@@ -316,68 +148,54 @@ Collect  Cancel orders → Merge YES+NO back to USDC
 ## Project Structure
 
 ```
-polymarket-terminal/
-├── src/
-│   ├── index.js               — Copy trade bot (TUI)
-│   ├── bot.js                 — Copy trade bot (plain log / PM2)
-│   ├── mm.js                  — Market maker bot (TUI)
-│   ├── mm-bot.js              — Market maker bot (plain log / PM2)
-│   ├── sniper.js              — Orderbook sniper bot
-│   │
-│   ├── config/
-│   │   └── index.js           — Environment variable loading & validation
-│   │
-│   ├── services/
-│   │   ├── client.js          — CLOB client initialization & USDC balance
-│   │   ├── watcher.js         — Poll-based trader activity detection
-│   │   ├── wsWatcher.js       — WebSocket real-time trade listener
-│   │   ├── executor.js        — Buy & sell order execution logic
-│   │   ├── position.js        — Position state management (CRUD)
-│   │   ├── autoSell.js        — Auto limit-sell placement
-│   │   ├── redeemer.js        — Market resolution check & CTF redemption
-│   │   ├── ctf.js             — On-chain CTF contract interactions
-│   │   ├── mmDetector.js      — Market detection for market maker
-│   │   ├── mmExecutor.js      — Market maker strategy execution
-│   │   ├── sniperDetector.js  — Market detection for sniper
-│   │   └── sniperExecutor.js  — Orderbook sniper order placement
-│   │
-│   ├── ui/
-│   │   └── dashboard.js       — Terminal UI (blessed)
-│   │
-│   └── utils/
-│       ├── logger.js          — Timestamped logging (TUI + plain modes)
-│       ├── state.js           — Atomic JSON state file management
-│       └── simStats.js        — Simulation P&L statistics
-│
-├── pm2/
-│   ├── copy.config.cjs        — PM2 config for copy trade bot
-│   └── mm.config.cjs          — PM2 config for market maker bot
-│
-├── data/                      — Runtime state files (gitignored)
-├── logs/                      — PM2 log files (gitignored)
-├── .env.example               — Configuration template
-├── .gitignore
-└── package.json
+src/
+├── maker-mm-bot.js          # Maker Rebate MM — PM2/VPS entry point
+├── maker-mm.js              # Maker Rebate MM — TUI entry point
+├── bot.js                   # Copy Trader
+├── sniper.js                # Orderbook Sniper
+├── mm-bot.js                # Classic MM (legacy)
+├── config/
+│   └── index.js             # All configuration with env var mapping
+└── services/
+    ├── makerRebateExecutor.js   # Core maker MM logic (orders, fills, merge)
+    ├── mmDetector.js            # Market discovery and scheduling
+    ├── mmWsFillWatcher.js       # WebSocket RTDS real-time fill detection
+    ├── ctf.js                   # CTF contract interaction (merge/redeem)
+    └── client.js                # Polymarket CLOB client wrapper
 ```
 
 ---
 
-## Important Warnings
+## How Maker Rebate Works on Polymarket
 
-- **Never commit your `.env` file.** Your private key must remain secret. The `.gitignore` already excludes it.
-- **Always start with `DRY_RUN=true`** (or a `*-sim` script) to verify the bot behaves as expected before using real funds.
-- **Use a small `SIZE_PERCENT`** for initial live runs to limit exposure.
-- **Keep MATIC in your EOA wallet** for gas fees (redeem operations and on-chain CTF calls).
-- **This software is provided as-is, with no guarantees.** Prediction market trading carries significant financial risk. You are solely responsible for any losses.
+Polymarket's CLOB gives **maker rebates** to traders who post limit orders, while takers pay a fee. This terminal exploits that by:
+
+1. Simultaneously posting BUY limit orders on both YES and NO of a binary market
+2. Since YES + NO always resolve to $1.00 (exactly one wins), buying both at combined cost < $1.00 guarantees a profit on merge
+3. The position is closed by merging the token pair back into USDC via Polymarket's CTF contract — not by holding to resolution
+
+This strategy is **market-neutral** and **direction-agnostic**. Profitability depends on fill rate and spread capture, not on predicting BTC price direction.
 
 ---
 
-## Credits
+## Risk Management
 
-Built and maintained by **[@direkturcrypto](https://twitter.com/direkturcrypto)**.
+- **No aggressive repricing**: after one side fills, the unfilled order stays at its original price — no chasing the market
+- **Combined cap enforced**: YES + NO bids always ≤ `MAKER_MM_MAX_COMBINED` — a merge always returns more than it cost
+- **One-sided stop**: if a cycle ends with only one side filled, re-entry for that market halts to prevent directional accumulation
+- **Cut-loss**: all open orders are cancelled 60 seconds before market close
+- **Odds filter**: skips re-entry if market odds exceed the configured threshold (default 70%)
 
 ---
 
 ## License
 
-ISC License — see [LICENSE](LICENSE) for details.
+MIT — free to use, fork, and modify.
+
+---
+
+## Contributing
+
+Pull requests are welcome. Open an issue for bugs or feature requests.
+
+Built for the Polymarket ecosystem. Not affiliated with Polymarket.

@@ -82,6 +82,32 @@ const config = {
   mmRecoveryThreshold: parseFloat(process.env.MM_RECOVERY_THRESHOLD || '0.70'), // min price to qualify
   mmRecoverySize: parseFloat(process.env.MM_RECOVERY_SIZE || '0'),    // 0 = use mmTradeSize
 
+  // ── Maker Rebate MM ────────────────────────────────────────────
+  // Buy YES+NO at top bid (maker), merge back to USDC ($1.00).
+  // Profit = spread + maker rebate fees.
+  makerMmAssets: (process.env.MAKER_MM_ASSETS || process.env.MM_ASSETS || 'btc')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+  makerMmDuration: process.env.MAKER_MM_DURATION || process.env.MM_DURATION || '5m',
+  makerMmTradeSize: parseFloat(process.env.MAKER_MM_TRADE_SIZE || '5'),        // USDC per side
+  makerMmMaxCombined: parseFloat(process.env.MAKER_MM_MAX_COMBINED || '0.99'), // max bid_YES + bid_NO
+  makerMmRepriceSec: parseInt(process.env.MAKER_MM_REPRICE_SEC || '3', 10),    // orderbook poll interval
+  makerMmFillTimeout: parseInt(process.env.MAKER_MM_FILL_TIMEOUT || '120', 10),  // secs for 2nd fill after 1st
+  makerMmCutLossTime: parseInt(process.env.MAKER_MM_CUT_LOSS_TIME || '60', 10), // secs before close to force exit
+  makerMmEntryWindow: parseInt(process.env.MAKER_MM_ENTRY_WINDOW || '45', 10),  // max secs after open to enter
+  makerMmPollInterval: parseInt(process.env.MAKER_MM_POLL_INTERVAL || process.env.MM_POLL_INTERVAL || '5', 10) * 1000,
+  makerMmReentryDelay: parseInt(process.env.MAKER_MM_REENTRY_DELAY || '30', 10) * 1000, // ms delay between re-entry cycles
+  makerMmRepriceThreshold: parseFloat(process.env.MAKER_MM_REPRICE_THRESHOLD || '0.02'), // reprice if bid drifts > this (default 2c)
+  makerMmMinPrice: parseFloat(process.env.MAKER_MM_MIN_PRICE || '0.30'),   // min bid for rebate range (both sides)
+  makerMmMaxPrice: parseFloat(process.env.MAKER_MM_MAX_PRICE || '0.69'),   // max bid for rebate range (both sides)
+
+  // ── Current Market Settings ────────────────────────────────────
+  // Enable trading on current active market (not just next market)
+  currentMarketEnabled: process.env.CURRENT_MARKET_ENABLED === 'true',
+  // Max odds threshold for current market (stop re-entry if odds drop below this)
+  currentMarketMaxOdds: parseFloat(process.env.CURRENT_MARKET_MAX_ODDS || '0.70'),
+  // Max odds threshold for next market (only enter if max odds <= this)
+  nextMarketMaxOdds: parseFloat(process.env.NEXT_MARKET_MAX_ODDS || '0.52'),
+
   // ── Orderbook Sniper ───────────────────────────────────────────
   // 3-tier strategy: places GTC limit BUY orders at 3c, 2c, and 1c
   // Tier 1 (3c): smallest size | Tier 2 (2c): medium size | Tier 3 (1c): largest size
@@ -159,6 +185,18 @@ export function validateMMConfig() {
   if (config.mmTradeSize <= 0) throw new Error('MM_TRADE_SIZE must be > 0');
   if (config.mmSellPrice <= 0 || config.mmSellPrice >= 1)
     throw new Error('MM_SELL_PRICE must be between 0 and 1');
+}
+
+// Validation for maker-rebate MM bot
+export function validateMakerMMConfig() {
+  const required = ['privateKey', 'proxyWallet'];
+  const missing = required.filter((key) => !config[key]);
+  if (missing.length > 0) {
+    throw new Error(`Missing required config: ${missing.join(', ')}. Check your .env file.`);
+  }
+  if (config.makerMmTradeSize <= 0) throw new Error('MAKER_MM_TRADE_SIZE must be > 0');
+  if (config.makerMmMaxCombined <= 0 || config.makerMmMaxCombined >= 1)
+    throw new Error('MAKER_MM_MAX_COMBINED must be between 0 and 1 exclusive');
 }
 
 export default config;

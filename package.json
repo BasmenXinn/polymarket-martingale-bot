@@ -22,6 +22,10 @@
     "sniper-tui": "DRY_RUN=false node src/sniper-tui.js",
     "sniper-tui-sim": "DRY_RUN=true node src/sniper-tui.js",
     "sniper-tui-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/sniper-tui.js",
+    "maker-mm": "DRY_RUN=false node src/maker-mm.js",
+    "maker-mm-sim": "DRY_RUN=true node src/maker-mm.js",
+    "maker-mm-bot": "node src/maker-mm-bot.js",
+    "maker-mm-bot-sim": "DRY_RUN=true node src/maker-mm-bot.js",
     "postinstall": "node scripts/patch-clob-client.cjs"
   },
   "keywords": [

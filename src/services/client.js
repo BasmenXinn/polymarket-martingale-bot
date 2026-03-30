@@ -1,11 +1,12 @@
 import { ClobClient } from '@polymarket/clob-client';
-import { Wallet } from 'ethers';
+import { ethers, Wallet } from 'ethers';
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 import { setupAxiosProxy, testProxy } from '../utils/proxy.js';
 
 let clobClient = null;
 let signer = null;
+let _provider = null; // singleton — reused across all onchain calls
 
 /**
  * Initialize the Polymarket CLOB client
@@ -79,20 +80,22 @@ export function getSigner() {
 }
 
 /**
- * Get a working Polygon provider using RPC from config
+ * Get (or create) the singleton Polygon provider.
+ * A single JsonRpcProvider instance is reused across all onchain calls
+ * to avoid reconnection overhead on every balance check.
  */
-export async function getPolygonProvider() {
-    const { ethers } = await import('ethers');
-    const provider = new ethers.providers.JsonRpcProvider(config.polygonRpcUrl);
-    return provider;
+export function getPolygonProvider() {
+    if (!_provider) {
+        _provider = new ethers.providers.JsonRpcProvider(config.polygonRpcUrl);
+    }
+    return _provider;
 }
 
 /**
  * Get USDC.e balance of the proxy wallet on Polygon
  */
 export async function getUsdcBalance() {
-    const { ethers } = await import('ethers');
-    const provider = await getPolygonProvider();
+    const provider = getPolygonProvider();
     const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e on Polygon
     const abi = ['function balanceOf(address) view returns (uint256)'];
     const usdc = new ethers.Contract(usdcAddress, abi, provider);

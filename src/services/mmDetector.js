@@ -7,28 +7,31 @@
  * e.g.  btc-updown-5m-1771755000
  *       eth-updown-15m-1771754100
  *
- * NEVER enters the currently active market — always targets the NEXT upcoming slot.
+ * poll() targets the NEXT upcoming slot. checkCurrentMarket() enters the current slot on startup.
  */
 
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 import { proxyFetch } from '../utils/proxy.js';
 
-// Slot size in seconds (300 for 5m, 900 for 15m)
-const SLOT_SEC = config.mmDuration === '15m' ? 900 : 300;
-
 let pollTimer = null;
 let onMarketCb = null;
 const seenKeys = new Set(); // `${asset}-${slotTimestamp}` already scheduled
 
 // ── Slot helpers ──────────────────────────────────────────────────────────────
+// Computed dynamically so config.mmDuration overrides in maker-mm.js take effect.
+
+function slotSec() {
+    return config.mmDuration === '15m' ? 900 : 300;
+}
 
 function currentSlot() {
-    return Math.floor(Date.now() / 1000 / SLOT_SEC) * SLOT_SEC;
+    const s = slotSec();
+    return Math.floor(Date.now() / 1000 / s) * s;
 }
 
 function nextSlot() {
-    return currentSlot() + SLOT_SEC;
+    return currentSlot() + slotSec();
 }
 
 // ── Gamma API fetch ───────────────────────────────────────────────────────────
@@ -148,5 +151,50 @@ export function stopMMDetector() {
     if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
+    }
+}
+
+// ── Check current active market on startup ────────────────────────────────────
+// Enters the currently running market slot if enough time remains.
+// Enabled unconditionally for the maker rebate bot — call only from maker-mm.js.
+export async function checkCurrentMarket(onMarketFound) {
+    const current = currentSlot();
+    const cutLossSec = config.makerMmCutLossTime ?? 60;
+    const tag = '[CURRENT]';
+
+    logger.info(`MM${tag}: checking current slot ${current} (${config.mmDuration}) for assets: ${config.mmAssets.join(', ').toUpperCase()}`);
+
+    for (const asset of config.mmAssets) {
+        const key = `${asset}-${current}`;
+        if (seenKeys.has(key)) {
+            logger.info(`MM${tag}: ${asset.toUpperCase()} already seen — skip`);
+            continue;
+        }
+
+        const market = await fetchBySlug(asset, current);
+        if (!market) {
+            logger.warn(`MM${tag}: ${asset.toUpperCase()} — no market found for slot ${current} (slug: ${asset}-updown-${config.mmDuration}-${current})`);
+            continue;
+        }
+
+        const data = extractMarketData(market, asset);
+        if (!data) {
+            logger.warn(`MM${tag}: ${asset.toUpperCase()} — market found but missing token IDs, skipping`);
+            seenKeys.add(key);
+            continue;
+        }
+
+        const msRemaining = new Date(data.endTime).getTime() - Date.now();
+        const secsRemaining = Math.round(msRemaining / 1000);
+
+        if (isNaN(secsRemaining) || secsRemaining <= cutLossSec) {
+            logger.info(`MM${tag}: ${asset.toUpperCase()} current market ${secsRemaining}s left (≤ cutLoss ${cutLossSec}s) — skipping`);
+            seenKeys.add(key);
+            continue;
+        }
+
+        seenKeys.add(key);
+        logger.success(`MM${tag}: ${asset.toUpperCase()} entering current market "${data.question.slice(0, 40)}" (${secsRemaining}s left)`);
+        onMarketFound(data);
     }
 }

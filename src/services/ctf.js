@@ -73,6 +73,10 @@ function parseOnchainError(err) {
         return 'Priority fee below Polygon minimum (25 Gwei)';
     if (msg.includes('UNPREDICTABLE_GAS_LIMIT'))
         return 'Gas estimation failed — transaction will likely revert';
+    if (msg.includes('GS026'))
+        return 'Safe nonce conflict (GS026) — another transaction consumed this nonce';
+    if (msg.includes('GS013'))
+        return 'Safe execution failed (GS013) — inner transaction reverted';
     if (msg.includes('execution reverted') || err?.code === 'CALL_EXCEPTION')
         return reason ? `Transaction reverted: ${reason}` : 'Transaction reverted by smart contract';
     if (msg.includes('timeout') || msg.includes('TIMEOUT'))
@@ -117,7 +121,7 @@ let _strategyTxActive = false;
  *                                         Non-priority calls (redeemer) wait until no strategy tx is active.
  */
 export function execSafeCall(to, data, description = '', opts = {}) {
-    const { priority = true } = opts;
+    const { priority = true, gasLimit } = opts;
 
     const job = async () => {
         // Non-priority (redeemer): wait if a strategy tx is active
@@ -131,7 +135,7 @@ export function execSafeCall(to, data, description = '', opts = {}) {
 
         if (priority) _strategyTxActive = true;
         try {
-            return await _doExecSafeCall(to, data, description);
+            return await _doExecSafeCall(to, data, description, gasLimit);
         } finally {
             if (priority) _strategyTxActive = false;
         }
@@ -144,7 +148,7 @@ export function execSafeCall(to, data, description = '', opts = {}) {
     return result;
 }
 
-async function _doExecSafeCall(to, data, description = '') {
+async function _doExecSafeCall(to, data, description = '', gasLimit = undefined) {
     if (description) logger.info(`MM: exec safe tx — ${description}`);
 
     let lastErr;
@@ -203,12 +207,15 @@ async function _doExecSafeCall(to, data, description = '') {
                 ? MAX_FEE_CAP
                 : estimatedMaxFee.mul(Math.ceil(currentMultiplier * 100)).div(100);
 
+            const txOpts = { maxPriorityFeePerGas: gasTip, maxFeePerGas: gasFeeCap };
+            if (gasLimit) txOpts.gasLimit = gasLimit;
+
             const tx = await safe.execTransaction(
                 to, 0, data, 0, 0, 0, 0,
                 ethers.constants.AddressZero,
                 ethers.constants.AddressZero,
                 signature,
-                { maxPriorityFeePerGas: gasTip, maxFeePerGas: gasFeeCap },
+                txOpts,
             );
 
             const receipt = await tx.wait();
@@ -287,6 +294,50 @@ export async function ensureExchangeApproval(negRisk = false) {
     logger.success(`MM: CTF exchange approved as ERC1155 operator`);
 }
 
+// ── Helper: Redeem after merge ───────────────────────────────────────────────
+
+/**
+ * Redeem positions for a specific conditionId (after successful merge).
+ * This is a thin wrapper around redeemPositions to support auto-redeem.
+ *
+ * @param {string} conditionId - Market conditionId to redeem
+ * @param {boolean} negRisk - Whether the market uses negRisk exchange
+ */
+export async function redeemPositions(conditionId, negRisk = false) {
+    if (config.dryRun) {
+        logger.info(`MM[SIM]: redeem positions for conditionId=${conditionId?.slice(0, 10)}...`);
+        return;
+    }
+
+    // Pre-check: ensure market has resolved before calling redeemPositions.
+    // If payoutDenominator == 0, the condition is unresolved — redeemPositions will
+    // revert and the Safe wraps that as GS013. Throw a clear error instead.
+    try {
+        const provider = getPolygonProvider();
+        const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, provider);
+        const denominator = await ctf.payoutDenominator(conditionId);
+        if (denominator.isZero()) {
+            throw new Error(`Market not resolved yet (payoutDenominator=0) — cannot redeem conditionId=${conditionId?.slice(0, 12)}`);
+        }
+    } catch (err) {
+        if (err.message.includes('payoutDenominator=0') || err.message.includes('not resolved')) throw err;
+        // RPC error on pre-check — log and proceed anyway (let execSafeCall handle it)
+        logger.warn(`MM: redeemPositions pre-check failed — ${err.message} — proceeding anyway`);
+    }
+
+    const ctfIface = new ethers.utils.Interface(CTF_ABI);
+    const data = ctfIface.encodeFunctionData('redeemPositions', [
+        USDC_ADDRESS,
+        ethers.constants.HashZero,
+        conditionId,
+        [1, 2],
+    ]);
+
+    // gasLimit bypasses eth_estimateGas RPC flakiness (same reason as mergePositions).
+    // GS013 without gasLimit = inner CTF call reverted, often due to gas estimation failure.
+    await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${conditionId?.slice(0, 12)}...`, { gasLimit: 500_000 });
+}
+
 // ── Core CTF operations ───────────────────────────────────────────────────────
 
 /**
@@ -355,7 +406,13 @@ export async function mergePositions(conditionId, sharesPerSide) {
         return recovered;
     }
 
-    const amountWei = ethers.utils.parseUnits(sharesPerSide.toFixed(6), 6);
+    // Floor to exact 6-decimal integer to prevent requesting more units than the Safe holds.
+    // Floating point round-trip (e.g. 4.910199 → toFixed(4) → 4.9102 → 4910200 wei)
+    // can exceed actual on-chain balance by 1 unit, causing the CTF merge to revert.
+    const amountWei = ethers.utils.parseUnits(
+        (Math.floor(sharesPerSide * 1_000_000) / 1_000_000).toFixed(6),
+        6,
+    );
 
     const ctfIface = new ethers.utils.Interface(CTF_ABI);
     const data = ctfIface.encodeFunctionData('mergePositions', [
@@ -366,7 +423,10 @@ export async function mergePositions(conditionId, sharesPerSide) {
         amountWei,
     ]);
 
-    await execSafeCall(CTF_ADDRESS, data, `mergePositions conditionId=${conditionId.slice(0, 10)}...`);
+    // Pass explicit gasLimit to bypass eth_estimateGas — Polygon RPC instability
+    // can cause estimateGas to fail even when the tx would succeed onchain.
+    // 500k gas is well above the ~200-250k typically consumed by a Safe+CTF merge.
+    await execSafeCall(CTF_ADDRESS, data, `mergePositions conditionId=${conditionId.slice(0, 10)}...`, { gasLimit: 500_000 });
     logger.success(`MM: merged — recovered $${sharesPerSide} USDC`);
     return sharesPerSide;
 }
