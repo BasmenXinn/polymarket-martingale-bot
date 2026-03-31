@@ -642,9 +642,11 @@ export async function executeMakerRebateStrategy(market) {
         // Safety: ensure NO is also strictly below NO ask (maker)
         if (noAsk && noBid >= noAsk) noBid = roundToTick(noAsk - ts, tickSize);
 
-        // Range check on NO bid
-        if (noBid < MIN_PRICE || noBid > MAX_PRICE) {
-            logger.info(`MakerMM${tag}: waiting — NO bid $${noBid.toFixed(3)} (need ${MIN_PRICE}-${MAX_PRICE})`);
+        // Sanity check on NO bid — only basic bounds, no range filter.
+        // MIN/MAX_PRICE applies to YES only (entry condition), not NO.
+        // e.g. YES=11c + NO=87c is valid even though NO > MAX_PRICE.
+        if (noBid <= 0 || noBid >= 1) {
+            logger.info(`MakerMM${tag}: waiting — NO bid $${noBid.toFixed(3)} out of bounds`);
             await sleep(POLL_SEC * 1000);
             continue;
         }
