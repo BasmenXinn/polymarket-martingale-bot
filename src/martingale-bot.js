@@ -42,7 +42,7 @@ config.mmDuration = CFG.duration;
 let activeAsset = CFG.assets[0] ?? 'btc';
 let pendingAsset = null;
 
-const ASSET_BINANCE = { btc: 'BTCUSDT', sol: 'SOLUSDT', eth: 'ETHUSDT' };
+const ASSET_BINANCE = { btc: 'BTCUSDT', sol: 'SOLUSDT', eth: 'ETHUSDT', xrp: 'XRPUSDT', doge: 'DOGEUSDT' };
 
 const sleep        = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -416,7 +416,7 @@ async function main() {
         ? `Current: ${activeAsset.toUpperCase()} → Pending: ${pendingAsset.toUpperCase()}`
         : `Current asset: ${activeAsset.toUpperCase()}`;
       await sendMessage(msg);
-    } else if (cmd === '/btc' || cmd === '/sol' || cmd === '/eth') {
+    } else if (cmd === '/btc' || cmd === '/sol' || cmd === '/eth' || cmd === '/xrp' || cmd === '/doge') {
       const newAsset = cmd.slice(1);
       if (newAsset === activeAsset && !pendingAsset) {
         await sendMessage(`Already trading ${newAsset.toUpperCase()}`);

@@ -18,6 +18,9 @@ let pollTimer = null;
 let onMarketCb = null;
 const seenKeys = new Set(); // `${asset}-${slotTimestamp}` already scheduled
 
+// Maps internal asset names to their Polymarket slug prefix
+const ASSET_SLUG = { doge: 'dogecoin', xrp: 'xrp' };
+
 // ── Slot helpers ──────────────────────────────────────────────────────────────
 // Computed dynamically so config.mmDuration overrides in maker-mm.js take effect.
 
@@ -37,7 +40,8 @@ function nextSlot() {
 // ── Gamma API fetch ───────────────────────────────────────────────────────────
 
 async function fetchBySlug(asset, slotTimestamp) {
-    const slug = `${asset}-updown-${config.mmDuration}-${slotTimestamp}`;
+    const slugAsset = ASSET_SLUG[asset] ?? asset;
+    const slug = `${slugAsset}-updown-${config.mmDuration}-${slotTimestamp}`;
     try {
         const resp = await proxyFetch(`${config.gammaHost}/markets/slug/${slug}`);
         if (!resp.ok) return null;
