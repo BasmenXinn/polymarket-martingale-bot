@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 import config from '../config/index.js';
-import { getPolygonProvider } from './client.js';
+import { getPolygonProvider, getUsdcBalance } from './client.js';
 import { execSafeCall, CTF_ADDRESS, USDC_ADDRESS } from './ctf.js';
 import { getOpenPositions, removePosition } from './position.js';
 import { loadMartingaleState, registerOutcome, printSummary } from './martingale.js';
@@ -192,10 +192,12 @@ export async function checkAndRedeemPositions() {
 
                     const totalPnl = (newState.history ?? []).reduce((acc, h) => acc + (h.pnl ?? 0), 0);
                     const nextBet  = REDEEM_CFG.baseSize * Math.pow(REDEEM_CFG.multiplier, newState.step);
+                    let balance = null;
+                    try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
                     if (pnl > 0) {
-                        notifyWin({ market: position.market, pnl, step: newState.step, totalPnl });
+                        notifyWin({ market: position.market, pnl, step: newState.step, totalPnl, balance });
                     } else {
-                        notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet });
+                        notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance });
                     }
                 } else {
                     logger.warn(`[Redeemer] Redeem failed for ${position.market} — will retry`);

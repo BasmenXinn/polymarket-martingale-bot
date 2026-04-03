@@ -288,11 +288,13 @@ async function onNewMarket(market) {
       const totalPnl = (newState.history ?? []).reduce((acc, h) => acc + (h.pnl ?? 0), 0);
       const nextBet  = CFG.baseSize * Math.pow(CFG.multiplier, newState.step);
 
+      let balance = null;
+      try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
       if (result === 'win') {
-        await safeNotify(() => notifyWin({ market: market.question, pnl, step: newState.step, totalPnl }));
+        await safeNotify(() => notifyWin({ market: market.question, pnl, step: newState.step, totalPnl, balance }));
         await checkBalanceAlert();
       } else {
-        await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet }));
+        await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
       }
     }
 

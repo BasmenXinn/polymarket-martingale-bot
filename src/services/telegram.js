@@ -33,23 +33,27 @@ export function notifyBuy({ market, betSize, price, side }) {
   );
 }
 
-export function notifyWin({ market, pnl, step, totalPnl }) {
+export function notifyWin({ market, pnl, step, totalPnl, balance }) {
+  const balanceLine = balance != null ? `\n💰 Balance: $${balance.toFixed(2)}` : '';
   return sendMessage(
     `✅ <b>WIN</b>\n` +
     `Market   : ${escHtml(market.slice(0, 60))}\n` +
     `PnL      : +$${pnl.toFixed(2)}\n` +
     `Step     : reset → 0\n` +
-    `Total PnL: $${totalPnl.toFixed(2)}`,
+    `Total PnL: $${totalPnl.toFixed(2)}` +
+    balanceLine,
   );
 }
 
-export function notifyLoss({ market, pnl, newStep, nextBet }) {
+export function notifyLoss({ market, pnl, newStep, nextBet, balance }) {
+  const balanceLine = balance != null ? `\n💰 Balance: $${balance.toFixed(2)}` : '';
   return sendMessage(
     `❌ <b>LOSS</b>\n` +
     `Market  : ${escHtml(market.slice(0, 60))}\n` +
     `PnL     : -$${Math.abs(pnl).toFixed(2)}\n` +
     `New Step: ${newStep}\n` +
-    `Next Bet: $${nextBet.toFixed(2)}`,
+    `Next Bet: $${nextBet.toFixed(2)}` +
+    balanceLine,
   );
 }
 
