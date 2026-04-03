@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import logger from './utils/logger.js';
-import { initClient } from './services/client.js';
+import { initClient, getUsdcBalance } from './services/client.js';
 import { startMMDetector, stopMMDetector, checkCurrentMarket } from './services/mmDetector.js';
 import {
   loadMartingaleState,
@@ -47,31 +47,84 @@ async function safeNotify(fn) {
   }
 }
 
+const BALANCE_ALERT_THRESHOLD = parseFloat(process.env.BALANCE_ALERT_THRESHOLD ?? '25');
+let balanceAlertFired = false; // reset when balance drops back below threshold
+
 let isProcessing   = false;
 let isShuttingDown = false;
 let redeemerTimer  = null;
 
+// ── Balance alert check ───────────────────────────────────────
+async function checkBalanceAlert() {
+  try {
+    const balance = await getUsdcBalance();
+    if (balance >= BALANCE_ALERT_THRESHOLD) {
+      if (!balanceAlertFired) {
+        balanceAlertFired = true;
+        logger.info(`[Balance] $${balance.toFixed(2)} ≥ threshold $${BALANCE_ALERT_THRESHOLD} — sending alert`);
+        await safeNotify(() => sendMessage(
+          `💰 <b>BALANCE ALERT</b>\n` +
+          `Current balance: <b>$${balance.toFixed(2)}</b>\n` +
+          `Target $${BALANCE_ALERT_THRESHOLD} reached!\n` +
+          `Consider withdrawing $10 at polymarket.com/portfolio`,
+        ));
+      }
+    } else {
+      balanceAlertFired = false; // reset so next crossing fires again
+    }
+  } catch (err) {
+    logger.warn(`[Balance] Check failed: ${err.message}`);
+  }
+}
+
 // ── Smart side selection via Binance ──────────────────────────
 async function getSmartSide() {
-  try {
-    const url = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=3';
-    const res  = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const candles = await res.json();
+  const THRESHOLD = 0.02; // % change to count as directional
 
-    const prev      = parseFloat(candles[candles.length - 2][4]);
-    const last      = parseFloat(candles[candles.length - 1][4]);
+  function getTrend(candles) {
+    const prev = parseFloat(candles[candles.length - 2][4]);
+    const last = parseFloat(candles[candles.length - 1][4]);
     const changePct = ((last - prev) / prev) * 100;
-    const sign      = changePct >= 0 ? '+' : '';
-    const fmt       = (n) => n.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    if (changePct > THRESHOLD)  return 'UP';
+    if (changePct < -THRESHOLD) return 'DOWN';
+    return 'FLAT';
+  }
 
-    if (Math.abs(changePct) < 0.05) {
-      logger.info(`[Smart] BTC $${fmt(prev)} → $${fmt(last)} (${sign}${changePct.toFixed(3)}%) → flat, defaulting to ${CFG.side}`);
-      return CFG.side;
+  try {
+    const base = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&limit=3&interval=';
+    const [r1, r3, r5] = await Promise.all([
+      fetch(base + '1m'),
+      fetch(base + '3m'),
+      fetch(base + '5m'),
+    ]);
+    if (!r1.ok || !r3.ok || !r5.ok) throw new Error(`HTTP ${r1.status}/${r3.status}/${r5.status}`);
+
+    const [c1, c3, c5] = await Promise.all([r1.json(), r3.json(), r5.json()]);
+    const t1 = getTrend(c1);
+    const t3 = getTrend(c3);
+    const t5 = getTrend(c5);
+
+    const ups   = [t1, t3, t5].filter(t => t === 'UP').length;
+    const downs = [t1, t3, t5].filter(t => t === 'DOWN').length;
+
+    let side;
+    let reason;
+
+    if (downs > ups) {
+      side   = 'NO';
+      reason = `${downs} DOWN > ${ups} UP → majority`;
+    } else if (ups > downs) {
+      side   = 'YES';
+      reason = `${ups} UP > ${downs} DOWN → majority`;
+    } else if (t5 !== 'FLAT') {
+      side   = t5 === 'UP' ? 'YES' : 'NO';
+      reason = `tied ${ups}v${downs} → 5m tiebreaker`;
+    } else {
+      side   = CFG.side;
+      reason = `tied ${ups}v${downs} → 5m flat → default`;
     }
 
-    const side = changePct > 0 ? 'YES' : 'NO';
-    logger.info(`[Smart] BTC $${fmt(prev)} → $${fmt(last)} (${sign}${changePct.toFixed(3)}%) → BET ${side}`);
+    logger.info(`[Smart] 1m=${t1} 3m=${t3} 5m=${t5} → ${reason} → BET ${side}`);
     return side;
 
   } catch (err) {
@@ -237,6 +290,7 @@ async function onNewMarket(market) {
 
       if (result === 'win') {
         await safeNotify(() => notifyWin({ market: market.question, pnl, step: newState.step, totalPnl }));
+        await checkBalanceAlert();
       } else {
         await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet }));
       }
@@ -258,6 +312,7 @@ function startRedeemerLoop() {
   async function tick() {
     try {
       await checkAndRedeemPositions();
+      await checkBalanceAlert();
     } catch (err) {
       logger.warn(`[Martingale] Redeemer error: ${err.message}`);
     }

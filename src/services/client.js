@@ -92,13 +92,11 @@ export function getPolygonProvider() {
 }
 
 /**
- * Get USDC.e balance of the proxy wallet on Polygon
+ * Get USDC balance via CLOB API collateral allowance.
+ * balance field is in micro USDC (6 decimals).
  */
 export async function getUsdcBalance() {
-    const provider = getPolygonProvider();
-    const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e on Polygon
-    const abi = ['function balanceOf(address) view returns (uint256)'];
-    const usdc = new ethers.Contract(usdcAddress, abi, provider);
-    const balance = await usdc.balanceOf(config.proxyWallet);
-    return parseFloat(ethers.utils.formatUnits(balance, 6));
+    const client = getClient();
+    const result = await client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+    return parseFloat(result.balance) / 1e6;
 }
