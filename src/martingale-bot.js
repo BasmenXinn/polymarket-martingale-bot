@@ -4,6 +4,7 @@ import { initClient, getUsdcBalance } from './services/client.js';
 import { startMMDetector, stopMMDetector, checkCurrentMarket } from './services/mmDetector.js';
 import {
   loadMartingaleState,
+  saveMartingaleState,
   calcNextBetSize,
   registerOutcome,
   printSummary,
@@ -36,6 +37,12 @@ const CFG = {
 
 config.mmAssets   = CFG.assets;
 config.mmDuration = CFG.duration;
+
+// ── Asset state ───────────────────────────────────────────────
+let activeAsset = CFG.assets[0] ?? 'btc';
+let pendingAsset = null;
+
+const ASSET_BINANCE = { btc: 'BTCUSDT', sol: 'SOLUSDT', eth: 'ETHUSDT' };
 
 const sleep        = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -91,7 +98,8 @@ async function getSmartSide() {
   }
 
   try {
-    const base = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&limit=3&interval=';
+    const symbol = ASSET_BINANCE[activeAsset] ?? 'BTCUSDT';
+    const base = `https://api.binance.com/api/v3/klines?symbol=${symbol}&limit=3&interval=`;
     const [r1, r3, r5] = await Promise.all([
       fetch(base + '1m'),
       fetch(base + '3m'),
@@ -251,7 +259,21 @@ async function onNewMarket(market) {
 
     const result = await placeBuy(client, market, betSize, side);
     if (!result) {
-      logger.warn('[Martingale] Buy failed — skip round');
+      let balance = null;
+      try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
+      if (balance !== null && balance < betSize) {
+        const freshState = { ...state, step: 0 };
+        saveMartingaleState(freshState);
+        logger.warn(`[Martingale] Insufficient balance ($${balance.toFixed(2)} < $${betSize.toFixed(2)}) — reset to step 0`);
+        await safeNotify(() => sendMessage(
+          `⚠️ <b>INSUFFICIENT BALANCE</b>\n` +
+          `Required: $${betSize.toFixed(2)}\n` +
+          `Available: $${balance.toFixed(2)}\n` +
+          `Resetting to step 0, bet $${CFG.baseSize.toFixed(2)}`,
+        ));
+      } else {
+        logger.warn('[Martingale] Buy failed — skip round');
+      }
       isProcessing = false;
       return;
     }
@@ -303,6 +325,13 @@ async function onNewMarket(market) {
     await safeNotify(() => notifyError(err.message));
   } finally {
     isProcessing = false;
+    if (pendingAsset) {
+      activeAsset = pendingAsset;
+      pendingAsset = null;
+      config.mmAssets = [activeAsset];
+      logger.info(`[Martingale] Switched to ${activeAsset.toUpperCase()}`);
+      await safeNotify(() => sendMessage(`🔄 Now trading ${activeAsset.toUpperCase()}`));
+    }
   }
 }
 
@@ -370,14 +399,31 @@ async function main() {
     const nextBet  = CFG.baseSize * Math.pow(CFG.multiplier, s.step);
 
     if (cmd === '/status') {
+      const assetLine = pendingAsset
+        ? `Asset     : ${activeAsset.toUpperCase()} → ${pendingAsset.toUpperCase()} (pending)\n`
+        : `Asset     : ${activeAsset.toUpperCase()}\n`;
       await sendMessage(
         `<b>Martingale Status</b>\n` +
         `Mode      : ${CFG.dryRun ? 'DRY RUN' : 'LIVE'}\n` +
+        assetLine +
         `Step      : ${s.step} / ${CFG.maxSteps}\n` +
         `Next bet  : $${nextBet.toFixed(2)}\n` +
         `Wins      : ${wins} | Losses: ${losses}\n` +
         `Total PnL : $${totalPnl.toFixed(2)}`,
       );
+    } else if (cmd === '/asset') {
+      const msg = pendingAsset
+        ? `Current: ${activeAsset.toUpperCase()} → Pending: ${pendingAsset.toUpperCase()}`
+        : `Current asset: ${activeAsset.toUpperCase()}`;
+      await sendMessage(msg);
+    } else if (cmd === '/btc' || cmd === '/sol' || cmd === '/eth') {
+      const newAsset = cmd.slice(1);
+      if (newAsset === activeAsset && !pendingAsset) {
+        await sendMessage(`Already trading ${newAsset.toUpperCase()}`);
+      } else {
+        pendingAsset = newAsset;
+        await sendMessage(`✅ Switching to ${newAsset.toUpperCase()} after current round`);
+      }
     } else if (cmd === '/pnl') {
       const last10 = history.slice(-10);
       if (last10.length === 0) {
