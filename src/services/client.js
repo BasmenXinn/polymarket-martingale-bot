@@ -51,7 +51,7 @@ export async function initClient() {
         config.chainId,
         signer,
         apiCreds,
-        2, // Signature type: 2 = POLY_PROXY (EOA signs on behalf of proxy wallet)
+        2, // Signature type: 0 = EOA (EOA signs on behalf of proxy wallet)
         config.proxyWallet, // Funder = proxy wallet (deposit USDC.e here)
     );
 

@@ -3,9 +3,18 @@ import config from '../config/index.js';
 import { getPolygonProvider } from './client.js';
 import { execSafeCall, CTF_ADDRESS, USDC_ADDRESS } from './ctf.js';
 import { getOpenPositions, removePosition } from './position.js';
+import { loadMartingaleState, registerOutcome, printSummary } from './martingale.js';
 import { recordSimResult } from '../utils/simStats.js';
 import logger from '../utils/logger.js';
 import { proxyFetch } from '../utils/proxy.js';
+import { notifyRedeem, notifyWin, notifyLoss } from './telegram.js';
+
+const REDEEM_CFG = {
+  baseSize:    parseFloat(process.env.MARTINGALE_BASE_SIZE    ?? '1'),
+  multiplier:  parseFloat(process.env.MARTINGALE_MULTIPLIER   ?? '2'),
+  maxSteps:    parseInt  (process.env.MARTINGALE_MAX_STEPS    ?? '5', 10),
+  resetOnWin:  (process.env.MARTINGALE_RESET_ON_WIN ?? 'true') === 'true',
+};
 
 // CTF ABI (minimal — read-only calls only; writes go through execSafeCall)
 const CTF_ABI = [
@@ -85,10 +94,10 @@ async function redeemPosition(conditionId) {
         const receipt = await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`);
         const txHash = receipt.transactionHash;
         logger.success(`Redeemed in block ${receipt.blockNumber} | tx: ${txHash}`);
-        return true;
+        return txHash;
     } catch (err) {
         logger.error(`Failed to redeem: ${err.message}`);
-        return false;
+        return null;
     }
 }
 
@@ -128,53 +137,72 @@ async function simulateRedeem(position) {
     }
 
     removePosition(position.conditionId);
-    return true;
+    return { pnl, returned };
 }
 
 /**
- * Check all open positions for resolved markets and redeem/simulate
+ * Check all open positions for resolved markets and redeem.
+ * WIN/LOSS notifications and step updates are handled by the main bot loop.
+ * The redeemer only auto-claims USDC and sends the AUTO CLAIM notification.
  */
 export async function checkAndRedeemPositions() {
     const positions = getOpenPositions();
+    logger.info('[Redeemer] checking ' + positions.length + ' positions');
     if (positions.length === 0) return;
 
-    logger.info(`Checking ${positions.length} position(s) for resolution...`);
+    logger.info(`[Redeemer] Checking ${positions.length} position(s)...`);
 
     for (const position of positions) {
         try {
-            // 1. Quick check via Gamma API (low cost)
+            // 1. Quick check via Gamma API
             const resolution = await checkMarketResolution(position.conditionId);
-            const apiResolved = resolution?.resolved;
+            if (!resolution?.resolved) continue;
 
-            if (!apiResolved) continue; // Not resolved yet — check again next interval
+            logger.info(`[Redeemer] Market resolved: ${position.market}`);
 
-            logger.info(`Market resolved via API: ${position.market}`);
-
-            // 2. ALWAYS verify on-chain payout before calling redeemPositions.
-            //    Gamma API can report "resolved" before payoutDenominator is written
-            //    on-chain. Calling redeemPositions with payoutDenominator == 0 causes
-            //    the contract to revert → gas estimation failure.
+            // 2. Verify on-chain payout is set before calling redeemPositions
             const onChain = await checkOnChainPayout(position.conditionId);
             if (!onChain.resolved) {
-                logger.info(`On-chain payout not set yet for ${position.market} — will retry next interval`);
+                logger.info(`[Redeemer] On-chain payout not set yet — will retry`);
                 continue;
             }
 
-            // 3. Simulate or execute real redeem
+            // 3. Simulate (dry-run) or execute real redeem
             if (config.dryRun) {
-                await simulateRedeem(position);
+                const result = await simulateRedeem(position);
+                if (result) {
+                    logger.money(`[Redeemer][SIM] Auto-claim: ${position.market} → $${result.returned.toFixed(4)} USDC`);
+                }
             } else {
-                const success = await redeemPosition(position.conditionId);
-                if (success) {
+                const txHash = await redeemPosition(position.conditionId);
+                if (txHash) {
+                    const outcomeIdx     = (position.outcome || 'yes').toLowerCase() === 'yes' ? 0 : 1;
+                    const payoutFraction = onChain.payouts[outcomeIdx] ?? 0;
+                    const returned       = payoutFraction * position.shares;
+                    const pnl            = returned - position.totalCost;
+
                     removePosition(position.conditionId);
-                    logger.money(`Redeemed: ${position.market} → USDC recovered`);
+                    logger.money(`[Redeemer] Claimed: ${position.market} → ${returned.toFixed(4)} USDC`);
+                    notifyRedeem({ market: position.market, amount: returned, pnl, txHash });
+
+                    const state    = loadMartingaleState();
+                    const outcome  = pnl > 0 ? 'win' : 'loss';
+                    const newState = registerOutcome(REDEEM_CFG, state, outcome, pnl, position.conditionId);
+                    printSummary(newState, REDEEM_CFG);
+
+                    const totalPnl = (newState.history ?? []).reduce((acc, h) => acc + (h.pnl ?? 0), 0);
+                    const nextBet  = REDEEM_CFG.baseSize * Math.pow(REDEEM_CFG.multiplier, newState.step);
+                    if (pnl > 0) {
+                        notifyWin({ market: position.market, pnl, step: newState.step, totalPnl });
+                    } else {
+                        notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet });
+                    }
                 } else {
-                    logger.warn(`Redeem failed for ${position.market}, will retry next interval — continuing to next position...`);
+                    logger.warn(`[Redeemer] Redeem failed for ${position.market} — will retry`);
                 }
             }
         } catch (err) {
-            logger.error(`Error checking ${position.market}:`, err.message);
-            logger.info(`Continuing to next position...`);
+            logger.error(`[Redeemer] Error on ${position.market}: ${err.message}`);
         }
     }
 }

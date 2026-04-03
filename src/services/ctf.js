@@ -179,7 +179,8 @@ async function _doExecSafeCall(to, data, description = '', gasLimit = undefined)
 
             // Sign the raw hash with the EOA signing key (no EIP-191 prefix)
             // Gnosis Safe v1.3.0 treats plain ECDSA signatures (v=27/28) on the tx hash directly
-            const signingKey = new ethers.utils.SigningKey(config.privateKey);
+            const rawKey = config.privateKey.startsWith('0x') ? config.privateKey : '0x' + config.privateKey;
+            const signingKey = new ethers.utils.SigningKey(rawKey);
             const rawSig = signingKey.signDigest(txHash);
             const signature = ethers.utils.joinSignature(rawSig);
 
