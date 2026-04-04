@@ -109,7 +109,7 @@ export async function startPolling(commandHandler) {
   }
 
   logger.info('[Telegram] Command polling started');
-  sendMessage('🤖 <b>Martingale Bot started</b>\nCommands: /status /pnl /stop /start /reset /btc /sol /eth /xrp /doge /asset');
+  sendMessage('🤖 <b>Martingale Bot started</b>\nCommands: /status /pnl /stop /start /reset /yes /no /auto /btc /sol /eth /xrp /doge /asset');
 
   async function poll() {
     try {

@@ -43,6 +43,7 @@ config.mmDuration = CFG.duration;
 // ── Asset state ───────────────────────────────────────────────
 let activeAsset = CFG.assets[0] ?? 'btc';
 let pendingAsset = null;
+let sideMode = 'auto'; // 'auto' | 'yes' | 'no'
 
 const ASSET_BINANCE = { btc: 'BTCUSDT', sol: 'SOLUSDT', eth: 'ETHUSDT', xrp: 'XRPUSDT', doge: 'DOGEUSDT' };
 
@@ -132,6 +133,9 @@ async function getLLMSide(marketName, mid, orderbookSignal) {
 
 // ── Smart side selection via orderbook midpoint + LLM ────────
 async function getSmartSide(client, market) {
+  if (sideMode === 'yes') { logger.info('[Smart] FORCE YES mode'); return 'YES'; }
+  if (sideMode === 'no')  { logger.info('[Smart] FORCE NO mode');  return 'NO';  }
+
   const yesTokenId = market.yesTokenId;
   let mid = 0.5;
 
@@ -219,16 +223,23 @@ async function placeBuy(client, market, betSize, side) {
     price        = parseFloat((Math.round(price / tick) * tick).toFixed(2));
     const shares = Math.ceil((betSize / price) * 100) / 100;
 
-    if (shares < 1) {
-      logger.error(`[Martingale] Shares too small: ${shares}`);
+    const MIN_SHARES  = 5;
+    const finalShares = Math.max(shares, MIN_SHARES);
+    if (finalShares > shares) {
+      logger.info(`[Martingale] Shares adjusted to minimum: ${finalShares.toFixed(2)}`);
+    }
+    const actualCost = finalShares * price;
+
+    if (finalShares < 1) {
+      logger.error(`[Martingale] Shares too small: ${finalShares}`);
       return null;
     }
 
-    logger.info(`[Martingale] Order: ${shares} shares @ $${price} | tickSize: ${tickSize} | negRisk: ${negRisk}`);
+    logger.info(`[Martingale] Order: ${finalShares} shares @ $${price} | cost: $${actualCost.toFixed(2)} | tickSize: ${tickSize} | negRisk: ${negRisk}`);
 
     const res = await Promise.race([
       client.createAndPostOrder(
-        { tokenID: tokenId, side: Side.BUY, price, size: shares },
+        { tokenID: tokenId, side: Side.BUY, price, size: finalShares },
         { tickSize, negRisk },
         OrderType.GTC,
       ),
@@ -242,8 +253,8 @@ async function placeBuy(client, market, betSize, side) {
 
     const fillPrice = parseFloat(res.price ?? String(price));
     logger.success(`[Martingale] BUY filled @ $${fillPrice.toFixed(3)}`);
-    safeNotify(() => notifyBuy({ market: market.question, betSize, price: fillPrice, side }));
-    return { fillPrice, shares };
+    safeNotify(() => notifyBuy({ market: market.question, betSize: actualCost, price: fillPrice, side }));
+    return { fillPrice, shares: finalShares };
 
   } catch (err) {
     logger.error(`[Martingale] Buy error: ${err.message}`);
@@ -492,6 +503,7 @@ async function main() {
   logger.info(`  Side     : ${CFG.side}`);
   logger.info(`  Base     : $${CFG.baseSize} | x${CFG.multiplier} | max step: ${CFG.maxSteps}`);
   logger.info(`  Target   : +${CFG.targetProfitPct}%`);
+  logger.info('  Commands : /status /yes /no /auto /btc /sol /eth /xrp /doge /pnl /reset /stop');
   logger.info('══════════════════════════════════════════════════');
 
   const client             = await initClient();
@@ -512,10 +524,14 @@ async function main() {
       const assetLine = pendingAsset
         ? `Asset     : ${activeAsset.toUpperCase()} → ${pendingAsset.toUpperCase()} (pending)\n`
         : `Asset     : ${activeAsset.toUpperCase()}\n`;
+      const sideLine = sideMode === 'yes' ? 'FORCE YES'
+                     : sideMode === 'no'  ? 'FORCE NO'
+                     : 'AUTO';
       await sendMessage(
         `<b>Martingale Status</b>\n` +
         `Mode      : ${CFG.dryRun ? 'DRY RUN' : 'LIVE'}\n` +
         assetLine +
+        `Side mode : ${sideLine}\n` +
         `Step      : ${s.step} / ${CFG.maxSteps}\n` +
         `Next bet  : $${nextBet.toFixed(2)}\n` +
         `Wins      : ${wins} | Losses: ${losses}\n` +
@@ -564,6 +580,15 @@ async function main() {
           sendMessage(`❌ Failed: ${e.message}`);
         }
       });
+    } else if (cmd === '/yes') {
+      sideMode = 'yes';
+      await sendMessage('✅ Mode: FORCE YES — bot will always bet YES');
+    } else if (cmd === '/no') {
+      sideMode = 'no';
+      await sendMessage('✅ Mode: FORCE NO — bot will always bet NO');
+    } else if (cmd === '/auto') {
+      sideMode = 'auto';
+      await sendMessage('✅ Mode: AUTO — bot will use 3-signal analysis');
     } else if (cmd === '/reset') {
       const emptyState = { step: 0, currentSize: null, history: [] };
       fs.writeFileSync('data/martingale-state.json', JSON.stringify(emptyState, null, 2));
