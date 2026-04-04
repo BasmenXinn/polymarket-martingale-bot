@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { exec } from 'child_process';
+import fs from 'fs';
 import logger from './utils/logger.js';
 import { initClient, getUsdcBalance } from './services/client.js';
 import { startMMDetector, stopMMDetector, checkCurrentMarket } from './services/mmDetector.js';
@@ -60,6 +62,7 @@ let balanceAlertFired = false; // reset when balance drops back below threshold
 let isProcessing   = false;
 let isShuttingDown = false;
 let redeemerTimer  = null;
+let consecutiveLossesAtMax = 0;
 
 // ── Balance alert check ───────────────────────────────────────
 async function checkBalanceAlert() {
@@ -86,59 +89,9 @@ async function checkBalanceAlert() {
 
 // ── Smart side selection via Binance ──────────────────────────
 async function getSmartSide() {
-  const THRESHOLD = 0.02; // % change to count as directional
-
-  function getTrend(candles) {
-    const prev = parseFloat(candles[candles.length - 2][4]);
-    const last = parseFloat(candles[candles.length - 1][4]);
-    const changePct = ((last - prev) / prev) * 100;
-    if (changePct > THRESHOLD)  return 'UP';
-    if (changePct < -THRESHOLD) return 'DOWN';
-    return 'FLAT';
-  }
-
-  try {
-    const symbol = ASSET_BINANCE[activeAsset] ?? 'BTCUSDT';
-    const base = `https://api.binance.com/api/v3/klines?symbol=${symbol}&limit=3&interval=`;
-    const [r1, r3, r5] = await Promise.all([
-      fetch(base + '1m'),
-      fetch(base + '3m'),
-      fetch(base + '5m'),
-    ]);
-    if (!r1.ok || !r3.ok || !r5.ok) throw new Error(`HTTP ${r1.status}/${r3.status}/${r5.status}`);
-
-    const [c1, c3, c5] = await Promise.all([r1.json(), r3.json(), r5.json()]);
-    const t1 = getTrend(c1);
-    const t3 = getTrend(c3);
-    const t5 = getTrend(c5);
-
-    const ups   = [t1, t3, t5].filter(t => t === 'UP').length;
-    const downs = [t1, t3, t5].filter(t => t === 'DOWN').length;
-
-    let side;
-    let reason;
-
-    if (downs > ups) {
-      side   = 'NO';
-      reason = `${downs} DOWN > ${ups} UP → majority`;
-    } else if (ups > downs) {
-      side   = 'YES';
-      reason = `${ups} UP > ${downs} DOWN → majority`;
-    } else if (t5 !== 'FLAT') {
-      side   = t5 === 'UP' ? 'YES' : 'NO';
-      reason = `tied ${ups}v${downs} → 5m tiebreaker`;
-    } else {
-      side   = CFG.side;
-      reason = `tied ${ups}v${downs} → 5m flat → default`;
-    }
-
-    logger.info(`[Smart] 1m=${t1} 3m=${t3} 5m=${t5} → ${reason} → BET ${side}`);
-    return side;
-
-  } catch (err) {
-    logger.warn(`[Smart] Binance fetch failed: ${err.message} — using ${CFG.side}`);
-    return CFG.side;
-  }
+  const side = Math.random() < 0.5 ? 'YES' : 'NO';
+  logger.info(`[Smart] Random → BET ${side}`);
+  return side;
 }
 
 // ── Place buy ─────────────────────────────────────────────────
@@ -313,10 +266,30 @@ async function onNewMarket(market) {
       let balance = null;
       try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
       if (result === 'win') {
+        consecutiveLossesAtMax = 0;
         await safeNotify(() => notifyWin({ market: market.question, pnl, step: newState.step, totalPnl, balance }));
         await checkBalanceAlert();
       } else {
-        await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
+        if (state.step >= CFG.maxSteps) {
+          consecutiveLossesAtMax++;
+          if (consecutiveLossesAtMax >= 2) {
+            consecutiveLossesAtMax = 0;
+            const maxBet    = CFG.baseSize * Math.pow(CFG.multiplier, CFG.maxSteps);
+            const resetState = { step: 0, currentSize: null, history: newState.history };
+            saveMartingaleState(resetState);
+            await safeNotify(() => sendMessage(
+              `🔄 <b>AUTO RESET</b>\n` +
+              `Lost 2x at max step ($${maxBet.toFixed(2)})\n` +
+              `Resetting to step 0, bet $${CFG.baseSize.toFixed(2)}\n` +
+              `Total PnL: $${totalPnl.toFixed(2)}`,
+            ));
+          } else {
+            await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
+          }
+        } else {
+          consecutiveLossesAtMax = 0;
+          await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
+        }
       }
     }
 
@@ -434,6 +407,32 @@ async function main() {
         );
         await sendMessage(`<b>Last ${last10.length} Trades</b>\n` + lines.join('\n'));
       }
+    } else if (cmd === '/start') {
+      exec('pm2 jlist', (err, stdout) => {
+        try {
+          const procs = JSON.parse(stdout || '[]');
+          const proc  = procs.find(p => (p.name ?? p.pm2_env?.name) === 'martingale-bot');
+          if (proc && proc.pm2_env?.status === 'online') {
+            sendMessage('⚠️ Bot is already running');
+          } else {
+            exec('pm2 start martingale-bot', (err2) => {
+              if (err2) {
+                sendMessage(`❌ Failed to start: ${err2.message}`);
+              } else {
+                sendMessage('✅ Bot started successfully');
+              }
+            });
+          }
+        } catch (e) {
+          sendMessage(`❌ Failed: ${e.message}`);
+        }
+      });
+    } else if (cmd === '/reset') {
+      const emptyState = { step: 0, currentSize: null, history: [] };
+      fs.writeFileSync('data/martingale-state.json', JSON.stringify(emptyState, null, 2));
+      fs.writeFileSync('data/positions.json', JSON.stringify({}));
+      consecutiveLossesAtMax = 0;
+      await sendMessage('✅ State reset! Step: 0, PnL: $0.00');
     } else if (cmd === '/stop') {
       if (isShuttingDown) return;
       isShuttingDown = true;
@@ -441,7 +440,6 @@ async function main() {
       stopMMDetector();
       stopRedeemerLoop();
       stopPolling();
-      const { exec } = await import('child_process');
       const pmTarget = process.env.name ?? process.env.pm_id ?? 'martingale-bot';
       exec(`pm2 stop ${pmTarget}`, () => process.exit(0));
     }
