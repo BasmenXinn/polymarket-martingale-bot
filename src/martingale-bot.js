@@ -12,7 +12,7 @@ import {
   printSummary,
 } from './services/martingale.js';
 import { checkAndRedeemPositions } from './services/redeemer.js';
-import { addPosition } from './services/position.js';
+import { addPosition, getOpenPositions } from './services/position.js';
 import { Side, OrderType } from '@polymarket/clob-client';
 import config from './config/index.js';
 import {
@@ -287,6 +287,16 @@ async function onNewMarket(market) {
   logger.info(`[Martingale] Asset: ${(market.asset ?? 'BTC').toUpperCase()} | Time left: ${Math.round(msLeft / 1000)}s`);
 
   try {
+    // Wait up to 120s for redeemer to settle any open positions before placing new bet
+    if (getOpenPositions().length > 0) {
+      logger.info('[Martingale] Waiting for previous position to settle...');
+      for (let i = 0; i < 24; i++) {
+        await sleep(5000);
+        if (getOpenPositions().length === 0) break;
+        logger.info('[Martingale] Waiting for previous position to settle...');
+      }
+    }
+
     const side    = await getSmartSide(client, market);
     const betSize = calcNextBetSize(CFG, state);
     logger.info(`[Martingale] Bet: $${betSize.toFixed(2)} | Side: ${side}`);
