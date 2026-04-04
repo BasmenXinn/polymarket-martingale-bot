@@ -158,20 +158,36 @@ async function getSmartSide(client, market) {
     orderbookSignal = `YES=${mid.toFixed(3)} (neutral 0.48-0.52) → random ${orderbookSide}`;
   }
 
+  // Signal 2: LLM
   const llmSide = await getLLMSide(market.question, mid, orderbookSignal);
 
-  let finalSide;
-  if (!llmSide) {
-    finalSide = orderbookSide;
-    logger.info(`[AI] LLM failed → BET ${finalSide} (orderbook fallback)`);
-  } else if (llmSide === orderbookSide) {
-    finalSide = llmSide;
-    logger.info(`[AI] LLM=${llmSide} Orderbook=${orderbookSide} → agree → BET ${finalSide}`);
-  } else {
-    finalSide = orderbookSide;
-    logger.info(`[AI] LLM=${llmSide} Orderbook=${orderbookSide} → disagree → BET ${finalSide} (orderbook wins)`);
+  // Signal 3: Extreme price contrarian
+  let extremeSide = null;
+  if (mid < 0.25) {
+    extremeSide = 'YES'; // market too pessimistic, expect rebound
+  } else if (mid > 0.75) {
+    extremeSide = 'NO';  // market too optimistic, expect correction
   }
 
+  // Majority vote across all 3 signals
+  const signals  = [orderbookSide, llmSide, extremeSide].filter(s => s !== null);
+  const yesCount = signals.filter(s => s === 'YES').length;
+  const noCount  = signals.filter(s => s === 'NO').length;
+
+  let finalSide;
+  let reason;
+  if (yesCount > noCount) {
+    finalSide = 'YES';
+    reason    = `${yesCount}v${noCount} majority`;
+  } else if (noCount > yesCount) {
+    finalSide = 'NO';
+    reason    = `${noCount}v${yesCount} majority`;
+  } else {
+    finalSide = orderbookSide;
+    reason    = `${yesCount}v${noCount} tie → orderbook`;
+  }
+
+  logger.info(`[Smart] Orderbook=${orderbookSide} LLM=${llmSide ?? 'null'} Extreme=${extremeSide ?? 'null'} → ${reason} → BET ${finalSide}`);
   return finalSide;
 }
 
@@ -242,6 +258,7 @@ async function placeBuy(client, market, betSize, side) {
 async function waitForOutcome(client, market, entryPrice, betSize, shares, side) {
   const targetPrice = entryPrice * 1.10;
   const tokenId = side === 'YES' ? market.yesTokenId : market.noTokenId;
+  let earlyExitAttempted = false;
 
   while (true) {
     const msLeft = new Date(market.endTime).getTime() - Date.now();
@@ -259,6 +276,33 @@ async function waitForOutcome(client, market, entryPrice, betSize, shares, side)
       ]);
       mid = parseFloat(result?.mid ?? result ?? '0') || 0;
     } catch(e) {}
+
+    // Early exit: attempt limit sell when <= 60s left and price is profitable
+    if (!earlyExitAttempted && msLeft <= 60000 && mid > entryPrice * 1.02 && !CFG.dryRun) {
+      earlyExitAttempted = true;
+      try {
+        logger.info(`[Martingale] Early exit! Locking profit @ $${mid.toFixed(3)}`);
+        const tick      = parseFloat(market.tickSize ?? '0.01');
+        const sellPrice = parseFloat((Math.round(mid / tick) * tick).toFixed(2));
+        const res = await Promise.race([
+          client.createAndPostOrder(
+            { tokenID: tokenId, side: Side.SELL, price: sellPrice, size: shares },
+            { tickSize: market.tickSize ?? '0.01', negRisk: market.negRisk ?? false },
+            OrderType.GTC,
+          ),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('early exit timeout')), 10000)),
+        ]);
+        if (res?.success) {
+          const exitPrice = parseFloat(res.price ?? String(sellPrice));
+          const pnl       = (exitPrice - entryPrice) * shares;
+          logger.success(`[Martingale] Early exit filled @ $${exitPrice.toFixed(3)} | PnL: $${pnl.toFixed(2)}`);
+          return { exitPrice, pnl };
+        }
+        logger.warn('[Martingale] Early exit order failed — continuing to resolution');
+      } catch (err) {
+        logger.warn(`[Martingale] Early exit error: ${err.message} — continuing to resolution`);
+      }
+    }
 
     logger.info(`[Martingale] mid=$${mid.toFixed(3)} | target=$${targetPrice.toFixed(3)} | sisa ${Math.round(msLeft/1000)}s`);
 

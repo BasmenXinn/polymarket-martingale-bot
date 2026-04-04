@@ -1,3 +1,4 @@
+import { exec } from 'child_process';
 import { ethers } from 'ethers';
 import config from '../config/index.js';
 import { getPolygonProvider, getUsdcBalance } from './client.js';
@@ -7,7 +8,34 @@ import { loadMartingaleState, registerOutcome, printSummary } from './martingale
 import { recordSimResult } from '../utils/simStats.js';
 import logger from '../utils/logger.js';
 import { proxyFetch } from '../utils/proxy.js';
-import { notifyRedeem, notifyWin, notifyLoss } from './telegram.js';
+import { sendMessage, notifyRedeem, notifyWin, notifyLoss } from './telegram.js';
+
+const STOP_LOSS_THRESHOLD   = parseFloat(process.env.STOP_LOSS_THRESHOLD   ?? '5');
+const TAKE_PROFIT_THRESHOLD = parseFloat(process.env.TAKE_PROFIT_THRESHOLD ?? '20');
+
+async function checkStopLoss(balance) {
+    if (balance !== null && balance < STOP_LOSS_THRESHOLD) {
+        logger.warn(`[Redeemer] STOP LOSS triggered — balance $${balance.toFixed(2)} < $${STOP_LOSS_THRESHOLD}`);
+        await sendMessage(
+            `🛑 <b>STOP LOSS TRIGGERED</b>\n` +
+            `Balance: <b>$${balance.toFixed(2)}</b>\n` +
+            `Bot stopped.`,
+        );
+        exec('pm2 stop martingale-bot');
+    }
+}
+
+async function checkTakeProfit(balance) {
+    if (balance !== null && balance >= TAKE_PROFIT_THRESHOLD) {
+        logger.info(`[Redeemer] TAKE PROFIT triggered — balance $${balance.toFixed(2)} >= $${TAKE_PROFIT_THRESHOLD}`);
+        await sendMessage(
+            `🎯 <b>TAKE PROFIT TRIGGERED</b>\n` +
+            `Balance: <b>$${balance.toFixed(2)}</b>\n` +
+            `Bot stopped.`,
+        );
+        exec('pm2 stop martingale-bot');
+    }
+}
 
 const REDEEM_CFG = {
   baseSize:    parseFloat(process.env.MARTINGALE_BASE_SIZE    ?? '1'),
@@ -185,8 +213,10 @@ export async function checkAndRedeemPositions() {
                     try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
                     if (pnl > 0) {
                         notifyWin({ market: position.market, pnl, step: newState.step, totalPnl, balance });
+                        await checkTakeProfit(balance);
                     } else {
                         notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance });
+                        await checkStopLoss(balance);
                     }
                 }
             } else {
@@ -211,8 +241,10 @@ export async function checkAndRedeemPositions() {
                     try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
                     if (pnl > 0) {
                         notifyWin({ market: position.market, pnl, step: newState.step, totalPnl, balance });
+                        await checkTakeProfit(balance);
                     } else {
                         notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance });
+                        await checkStopLoss(balance);
                     }
                     notifyRedeem({ market: position.market, amount: returned, pnl, txHash });
                 } else {
