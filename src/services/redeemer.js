@@ -199,7 +199,6 @@ export async function checkAndRedeemPositions() {
 
                     removePosition(position.conditionId);
                     logger.money(`[Redeemer] Claimed: ${position.market} → ${returned.toFixed(4)} USDC`);
-                    notifyRedeem({ market: position.market, amount: returned, pnl, txHash });
 
                     const state    = loadMartingaleState();
                     const outcome  = pnl > 0 ? 'win' : 'loss';
@@ -215,6 +214,7 @@ export async function checkAndRedeemPositions() {
                     } else {
                         notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance });
                     }
+                    notifyRedeem({ market: position.market, amount: returned, pnl, txHash });
                 } else {
                     logger.warn(`[Redeemer] Redeem failed for ${position.market} — will retry`);
                 }
