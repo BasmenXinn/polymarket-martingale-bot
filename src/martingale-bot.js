@@ -87,39 +87,92 @@ async function checkBalanceAlert() {
   }
 }
 
-// ── Smart side selection via orderbook midpoint ───────────────
-async function getSmartSide(client, market) {
+// ── LLM side suggestion via OpenRouter ───────────────────────
+async function getLLMSide(marketName, mid, orderbookSignal) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return null;
+
+  const prompt =
+    `You are a Polymarket trading assistant.\n` +
+    `Market: ${marketName}\n` +
+    `YES token price: ${mid.toFixed(3)} (0=certain DOWN, 1=certain UP, 0.5=50/50)\n` +
+    `Orderbook signal: ${orderbookSignal}\n\n` +
+    `Based on the YES price, should I bet YES or NO?\n` +
+    `Reply with ONLY one word: YES or NO`;
+
   try {
-    const yesTokenId = market.yesTokenId;
+    const res = await Promise.race([
+      fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'qwen/qwen3-6b:free',
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 5,
+        }),
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('LLM timeout')), 5000)),
+    ]);
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const text = (data?.choices?.[0]?.message?.content ?? '').trim().toUpperCase();
+    if (text === 'YES' || text === 'NO') return text;
+    // try extracting first word if model added extra tokens
+    const match = text.match(/\b(YES|NO)\b/);
+    return match ? match[1] : null;
+  } catch (err) {
+    logger.warn(`[AI] LLM request failed: ${err.message}`);
+    return null;
+  }
+}
+
+// ── Smart side selection via orderbook midpoint + LLM ────────
+async function getSmartSide(client, market) {
+  const yesTokenId = market.yesTokenId;
+  let mid = 0.5;
+
+  try {
     const result = await Promise.race([
       client.getMidpoint(yesTokenId),
       new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
     ]);
-
-    const mid = parseFloat(result?.mid ?? result ?? '0.5') || 0.5;
-
-    let side;
-    let reason;
-
-    if (mid < 0.48) {
-      side = 'NO';
-      reason = `YES=${mid.toFixed(3)} (cheap) → market expects DOWN`;
-    } else if (mid > 0.52) {
-      side = 'YES';
-      reason = `YES=${mid.toFixed(3)} (expensive) → market expects UP`;
-    } else {
-      side = Math.random() < 0.5 ? 'YES' : 'NO';
-      reason = `YES=${mid.toFixed(3)} (neutral 0.48-0.52) → random`;
-    }
-
-    logger.info(`[Smart] ${reason} → BET ${side}`);
-    return side;
-
+    mid = parseFloat(result?.mid ?? result ?? '0.5') || 0.5;
   } catch (err) {
-    const side = Math.random() < 0.5 ? 'YES' : 'NO';
-    logger.warn(`[Smart] Midpoint failed: ${err.message} → random ${side}`);
-    return side;
+    logger.warn(`[Smart] Midpoint failed: ${err.message} — using 0.5`);
   }
+
+  let orderbookSide;
+  let orderbookSignal;
+  if (mid < 0.48) {
+    orderbookSide   = 'NO';
+    orderbookSignal = `YES=${mid.toFixed(3)} (cheap) → market expects DOWN`;
+  } else if (mid > 0.52) {
+    orderbookSide   = 'YES';
+    orderbookSignal = `YES=${mid.toFixed(3)} (expensive) → market expects UP`;
+  } else {
+    orderbookSide   = Math.random() < 0.5 ? 'YES' : 'NO';
+    orderbookSignal = `YES=${mid.toFixed(3)} (neutral 0.48-0.52) → random ${orderbookSide}`;
+  }
+
+  const llmSide = await getLLMSide(market.question, mid, orderbookSignal);
+
+  let finalSide;
+  if (!llmSide) {
+    finalSide = orderbookSide;
+    logger.info(`[AI] LLM failed → BET ${finalSide} (orderbook fallback)`);
+  } else if (llmSide === orderbookSide) {
+    finalSide = llmSide;
+    logger.info(`[AI] LLM=${llmSide} Orderbook=${orderbookSide} → agree → BET ${finalSide}`);
+  } else {
+    finalSide = orderbookSide;
+    logger.info(`[AI] LLM=${llmSide} Orderbook=${orderbookSide} → disagree → BET ${finalSide} (orderbook wins)`);
+  }
+
+  return finalSide;
 }
 
 // ── Place buy ─────────────────────────────────────────────────
