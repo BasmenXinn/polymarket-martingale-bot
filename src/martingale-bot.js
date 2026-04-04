@@ -223,23 +223,16 @@ async function placeBuy(client, market, betSize, side) {
     price        = parseFloat((Math.round(price / tick) * tick).toFixed(2));
     const shares = Math.ceil((betSize / price) * 100) / 100;
 
-    const MIN_SHARES  = 5;
-    const finalShares = Math.max(shares, MIN_SHARES);
-    if (finalShares > shares) {
-      logger.info(`[Martingale] Shares adjusted to minimum: ${finalShares.toFixed(2)}`);
-    }
-    const actualCost = finalShares * price;
-
-    if (finalShares < 1) {
-      logger.error(`[Martingale] Shares too small: ${finalShares}`);
+    if (shares < 1) {
+      logger.error(`[Martingale] Shares too small: ${shares}`);
       return null;
     }
 
-    logger.info(`[Martingale] Order: ${finalShares} shares @ $${price} | cost: $${actualCost.toFixed(2)} | tickSize: ${tickSize} | negRisk: ${negRisk}`);
+    logger.info(`[Martingale] Order: ${shares} shares @ $${price} | tickSize: ${tickSize} | negRisk: ${negRisk}`);
 
     const res = await Promise.race([
       client.createAndPostOrder(
-        { tokenID: tokenId, side: Side.BUY, price, size: finalShares },
+        { tokenID: tokenId, side: Side.BUY, price, size: shares },
         { tickSize, negRisk },
         OrderType.GTC,
       ),
@@ -253,8 +246,8 @@ async function placeBuy(client, market, betSize, side) {
 
     const fillPrice = parseFloat(res.price ?? String(price));
     logger.success(`[Martingale] BUY filled @ $${fillPrice.toFixed(3)}`);
-    safeNotify(() => notifyBuy({ market: market.question, betSize: actualCost, price: fillPrice, side }));
-    return { fillPrice, shares: finalShares };
+    safeNotify(() => notifyBuy({ market: market.question, betSize, price: fillPrice, side }));
+    return { fillPrice, shares };
 
   } catch (err) {
     logger.error(`[Martingale] Buy error: ${err.message}`);
