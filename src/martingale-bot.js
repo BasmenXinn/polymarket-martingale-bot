@@ -87,11 +87,39 @@ async function checkBalanceAlert() {
   }
 }
 
-// ── Smart side selection via Binance ──────────────────────────
-async function getSmartSide() {
-  const side = Math.random() < 0.5 ? 'YES' : 'NO';
-  logger.info(`[Smart] Random → BET ${side}`);
-  return side;
+// ── Smart side selection via orderbook midpoint ───────────────
+async function getSmartSide(client, market) {
+  try {
+    const yesTokenId = market.yesTokenId;
+    const result = await Promise.race([
+      client.getMidpoint(yesTokenId),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
+    ]);
+
+    const mid = parseFloat(result?.mid ?? result ?? '0.5') || 0.5;
+
+    let side;
+    let reason;
+
+    if (mid < 0.40) {
+      side = 'NO';
+      reason = `YES=${mid.toFixed(3)} (cheap) → market expects DOWN`;
+    } else if (mid > 0.60) {
+      side = 'YES';
+      reason = `YES=${mid.toFixed(3)} (expensive) → market expects UP`;
+    } else {
+      side = Math.random() < 0.5 ? 'YES' : 'NO';
+      reason = `YES=${mid.toFixed(3)} (neutral 0.40-0.60) → random`;
+    }
+
+    logger.info(`[Smart] ${reason} → BET ${side}`);
+    return side;
+
+  } catch (err) {
+    const side = Math.random() < 0.5 ? 'YES' : 'NO';
+    logger.warn(`[Smart] Midpoint failed: ${err.message} → random ${side}`);
+    return side;
+  }
 }
 
 // ── Place buy ─────────────────────────────────────────────────
@@ -206,7 +234,7 @@ async function onNewMarket(market) {
   logger.info(`[Martingale] Asset: ${(market.asset ?? 'BTC').toUpperCase()} | Time left: ${Math.round(msLeft / 1000)}s`);
 
   try {
-    const side    = await getSmartSide();
+    const side    = await getSmartSide(client, market);
     const betSize = calcNextBetSize(CFG, state);
     logger.info(`[Martingale] Bet: $${betSize.toFixed(2)} | Side: ${side}`);
 
