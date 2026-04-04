@@ -109,7 +109,7 @@ async function getLLMSide(marketName, mid, orderbookSignal) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'qwen/qwen3-6b:free',
+          model: 'qwen/qwen3.6-plus:free',
           messages: [{ role: 'user', content: prompt }],
           max_tokens: 5,
         }),
