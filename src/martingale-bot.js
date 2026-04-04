@@ -223,9 +223,9 @@ async function placeBuy(client, market, betSize, side) {
     price        = parseFloat((Math.round(price / tick) * tick).toFixed(2));
     const shares = Math.ceil((betSize / price) * 100) / 100;
 
-    if (shares < 1) {
-      logger.error(`[Martingale] Shares too small: ${shares}`);
-      return null;
+    if (shares < 2) {
+      logger.warn(`[Martingale] Shares too low for this market — skip`);
+      return { skipped: true, reason: 'minimum_shares' };
     }
 
     logger.info(`[Martingale] Order: ${shares} shares @ $${price} | tickSize: ${tickSize} | negRisk: ${negRisk}`);
@@ -240,7 +240,12 @@ async function placeBuy(client, market, betSize, side) {
     ]);
 
     if (!res?.success) {
-      logger.error(`[Martingale] Buy failed: ${res?.errorMsg ?? 'no fill'}`);
+      const errMsg = res?.errorMsg ?? 'no fill';
+      if (errMsg.toLowerCase().includes('lower than the minimum')) {
+        logger.warn(`[Martingale] Order rejected — lower than minimum shares: ${errMsg}`);
+        return { skipped: true, reason: 'minimum_shares' };
+      }
+      logger.error(`[Martingale] Buy failed: ${errMsg}`);
       return null;
     }
 
@@ -353,6 +358,11 @@ async function onNewMarket(market) {
     logger.info(`[Martingale] Bet: $${betSize.toFixed(2)} | Side: ${side}`);
 
     const result = await placeBuy(client, market, betSize, side);
+    if (result?.skipped) {
+      logger.warn('[Martingale] Skipped — market minimum shares too high');
+      isProcessing = false;
+      return;
+    }
     if (!result) {
       let balance = null;
       try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
