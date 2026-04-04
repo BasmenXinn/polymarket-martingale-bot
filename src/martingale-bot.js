@@ -287,7 +287,10 @@ async function waitForOutcome(client, market, entryPrice, betSize, shares, side)
       try {
         logger.info(`[Martingale] Early exit! Locking profit @ $${mid.toFixed(3)}`);
         const tick      = parseFloat(market.tickSize ?? '0.01');
-        const sellPrice = parseFloat((Math.round(mid / tick) * tick).toFixed(2));
+        const sellPrice = Math.min(
+          parseFloat((Math.round(mid / tick) * tick).toFixed(2)),
+          0.99,
+        );
         const res = await Promise.race([
           client.createAndPostOrder(
             { tokenID: tokenId, side: Side.SELL, price: sellPrice, size: shares },
