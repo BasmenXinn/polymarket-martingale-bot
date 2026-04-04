@@ -223,7 +223,7 @@ async function placeBuy(client, market, betSize, side) {
     price        = parseFloat((Math.round(price / tick) * tick).toFixed(2));
     const shares = Math.ceil((betSize / price) * 100) / 100;
 
-    if (shares < 2) {
+    if (shares < 1) {
       logger.warn(`[Martingale] Shares too low for this market — skip`);
       return { skipped: true, reason: 'minimum_shares' };
     }
@@ -487,6 +487,76 @@ function stopRedeemerLoop() {
   }
 }
 
+// ── Morning briefing (07:00 WIB = 00:00 UTC) ─────────────────
+async function sendMorningBriefing() {
+  try {
+    const s       = loadMartingaleState();
+    const history = s.history ?? [];
+
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const h24    = history.filter(h => h.ts && new Date(h.ts).getTime() >= cutoff);
+
+    const h24Wins   = h24.filter(h => h.outcome === 'win').length;
+    const h24Losses = h24.filter(h => h.outcome === 'loss').length;
+    const h24Pnl    = h24.reduce((acc, h) => acc + (h.pnl ?? 0), 0);
+    const h24Rate   = h24.length > 0 ? ((h24Wins / h24.length) * 100).toFixed(1) : '0.0';
+
+    const allWins  = history.filter(h => h.outcome === 'win').length;
+    const allLoss  = history.filter(h => h.outcome === 'loss').length;
+    const allPnl   = history.reduce((acc, h) => acc + (h.pnl ?? 0), 0);
+    const allRate  = history.length > 0 ? ((allWins / history.length) * 100).toFixed(1) : '0.0';
+
+    let balance = null;
+    try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
+
+    const openCount = getOpenPositions().length;
+    const nextBet   = CFG.baseSize * Math.pow(CFG.multiplier, s.step);
+    const sideLine  = sideMode === 'yes' ? 'FORCE YES' : sideMode === 'no' ? 'FORCE NO' : 'AUTO';
+
+    const date = new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Jakarta', day: '2-digit', month: 'short', year: 'numeric' });
+
+    await sendMessage(
+      `☀️ <b>Morning Briefing</b>\n` +
+      `────────────────\n` +
+      `📅 ${date}\n` +
+      `────────────────\n` +
+      `<b>Last 24h Activity:</b>\n` +
+      `📥 Bets Placed: ${h24.length}\n` +
+      `✅ Wins: ${h24Wins} | ❌ Losses: ${h24Losses}\n` +
+      `📈 Win Rate: ${h24Rate}%\n` +
+      `💰 PnL (24h): $${h24Pnl.toFixed(2)}\n\n` +
+      `<b>All-time Performance:</b>\n` +
+      `🏆 Total Trades: ${history.length}\n` +
+      `📊 Win Rate: ${allRate}%\n` +
+      `💵 Total PnL: $${allPnl.toFixed(2)}\n` +
+      `💰 Balance: $${balance !== null ? balance.toFixed(2) : 'N/A'}\n\n` +
+      `<b>Current Status:</b>\n` +
+      `📂 Open Positions: ${openCount}\n` +
+      `🎯 Current Step: ${s.step}/${CFG.maxSteps}\n` +
+      `🤖 Asset: ${activeAsset.toUpperCase()} | Mode: ${sideLine}`,
+    );
+    logger.info('[Martingale] Morning briefing sent');
+  } catch (err) {
+    logger.warn(`[Martingale] Morning briefing failed: ${err.message}`);
+  }
+}
+
+function startMorningBriefing() {
+  let lastFiredDate = null;
+  setInterval(() => {
+    const now = new Date();
+    // Fire at 00:00 UTC (07:00 WIB)
+    if (now.getUTCHours() === 0 && now.getUTCMinutes() === 0) {
+      const today = now.toISOString().slice(0, 10);
+      if (lastFiredDate !== today) {
+        lastFiredDate = today;
+        sendMorningBriefing();
+      }
+    }
+  }, 60 * 1000);
+  logger.info('[Martingale] Morning briefing scheduler started (fires 00:00 UTC / 07:00 WIB)');
+}
+
 // ── Graceful shutdown ─────────────────────────────────────────
 async function shutdown(reason = 'SIGINT') {
   if (isShuttingDown) return;
@@ -614,6 +684,7 @@ async function main() {
   });
 
   startRedeemerLoop();
+  startMorningBriefing();
 
   logger.info('[Martingale] Checking active market...');
   await checkCurrentMarket(onNewMarket);
