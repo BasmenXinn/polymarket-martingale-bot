@@ -171,7 +171,23 @@ export async function checkAndRedeemPositions() {
             if (config.dryRun) {
                 const result = await simulateRedeem(position);
                 if (result) {
-                    logger.money(`[Redeemer][SIM] Auto-claim: ${position.market} → $${result.returned.toFixed(4)} USDC`);
+                    const { pnl, returned } = result;
+                    logger.money(`[Redeemer][SIM] Auto-claim: ${position.market} → $${returned.toFixed(4)} USDC`);
+
+                    const state    = loadMartingaleState();
+                    const outcome  = pnl > 0 ? 'win' : 'loss';
+                    const newState = registerOutcome(REDEEM_CFG, state, outcome, pnl, position.conditionId);
+                    printSummary(newState, REDEEM_CFG);
+
+                    const totalPnl = (newState.history ?? []).reduce((acc, h) => acc + (h.pnl ?? 0), 0);
+                    const nextBet  = REDEEM_CFG.baseSize * Math.pow(REDEEM_CFG.multiplier, newState.step);
+                    let balance = null;
+                    try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
+                    if (pnl > 0) {
+                        notifyWin({ market: position.market, pnl, step: newState.step, totalPnl, balance });
+                    } else {
+                        notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance });
+                    }
                 }
             } else {
                 const txHash = await redeemPosition(position.conditionId);

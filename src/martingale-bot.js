@@ -281,6 +281,8 @@ async function onNewMarket(market) {
     if (outcome.pending) {
       // Market closed — redeemer will handle WIN/LOSS via checkAndRedeemPositions
       logger.info('[Martingale] Outcome pending — redeemer will settle this round');
+      isProcessing = false;
+      return;
     } else {
       const { pnl } = outcome;
       // Register outcome and update martingale step
