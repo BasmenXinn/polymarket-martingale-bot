@@ -101,15 +101,15 @@ async function getSmartSide(client, market) {
     let side;
     let reason;
 
-    if (mid < 0.40) {
+    if (mid < 0.48) {
       side = 'NO';
       reason = `YES=${mid.toFixed(3)} (cheap) → market expects DOWN`;
-    } else if (mid > 0.60) {
+    } else if (mid > 0.52) {
       side = 'YES';
       reason = `YES=${mid.toFixed(3)} (expensive) → market expects UP`;
     } else {
       side = Math.random() < 0.5 ? 'YES' : 'NO';
-      reason = `YES=${mid.toFixed(3)} (neutral 0.40-0.60) → random`;
+      reason = `YES=${mid.toFixed(3)} (neutral 0.48-0.52) → random`;
     }
 
     logger.info(`[Smart] ${reason} → BET ${side}`);
