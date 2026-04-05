@@ -47,7 +47,7 @@ let sideMode = 'auto'; // 'auto' | 'yes' | 'no'
 
 const ASSET_BINANCE = { btc: 'BTCUSDT', sol: 'SOLUSDT', eth: 'ETHUSDT', xrp: 'XRPUSDT', doge: 'DOGEUSDT' };
 
-const sleep        = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function safeNotify(fn) {
   try {
@@ -58,12 +58,159 @@ async function safeNotify(fn) {
 }
 
 const BALANCE_ALERT_THRESHOLD = parseFloat(process.env.BALANCE_ALERT_THRESHOLD ?? '25');
-let balanceAlertFired = false; // reset when balance drops back below threshold
+let balanceAlertFired = false;
 
 let isProcessing   = false;
 let isShuttingDown = false;
 let redeemerTimer  = null;
-let consecutiveLossesAtMax = 0;
+let consecutiveLossesAtMax = 0; // existing auto-reset logic (kept)
+
+// ── V2 tracking variables ─────────────────────────────────────
+let dailyTradeCount = 0;
+let dailyPnl        = 0;
+let lastResetDate   = '';
+let consecutiveLosses = 0;
+let pauseUntil      = null;
+let pauseIsDaily    = false; // true when pause was triggered by daily loss limit
+let startingBalance = null;
+
+// ── [V2 L1] Daily reset ───────────────────────────────────────
+function checkDailyReset() {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+  if (lastResetDate !== today) {
+    lastResetDate     = today;
+    dailyTradeCount   = 0;
+    dailyPnl          = 0;
+    consecutiveLosses = 0;
+    if (pauseIsDaily) {
+      pauseUntil   = null;
+      pauseIsDaily = false;
+    }
+    logger.info(`[V2] Daily reset — date=${today} trades=0 pnl=$0 consecutiveLosses=0`);
+  }
+}
+
+// ── [V2 L1] Session info ──────────────────────────────────────
+function getSessionInfo() {
+  const h = new Date().getUTCHours();
+  if (h >= 1 && h < 7)  return { label: 'PRIME',      maxTrades: 50, confidenceMin: 0.55 };
+  if (h >= 7 && h < 13) return { label: 'OKAY',       maxTrades: 15, confidenceMin: 0.65 };
+  return                       { label: 'RESTRICTED', maxTrades: 10, confidenceMin: 0.75 };
+}
+
+// ── [V2 L3] Confidence threshold by session + step ────────────
+function getConfidenceThreshold(session, step) {
+  if (step === 0) return session.confidenceMin;
+  // Recovery steps (step >= 1) require higher confidence
+  const recovery = { PRIME: 0.70, OKAY: 0.75, RESTRICTED: 0.80 };
+  return recovery[session.label];
+}
+
+// ── [V2 L2] RSI (Wilder smoothing) ───────────────────────────
+function calcRSI(closes, period = 7) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff; else losses -= diff;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+// ── [V2 L2] Bollinger Bands ───────────────────────────────────
+function calcBB(closes, period = 20, mult = 2) {
+  if (closes.length < period) return null;
+  const slice    = closes.slice(-period);
+  const sma      = slice.reduce((a, b) => a + b, 0) / period;
+  const variance = slice.reduce((a, b) => a + (b - sma) ** 2, 0) / period;
+  const stddev   = Math.sqrt(variance);
+  return { upper: sma + mult * stddev, lower: sma - mult * stddev };
+}
+
+// ── [V2 L2] Advanced signal: RSI + Bollinger Bands + Wick ────
+async function getAdvancedSignal(asset) {
+  const symbol = ASSET_BINANCE[asset] ?? 'BTCUSDT';
+  try {
+    const res = await Promise.race([
+      fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=30`),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Binance timeout')), 5000)),
+    ]);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const klines = await res.json();
+
+    const opens  = klines.map(k => parseFloat(k[1]));
+    const highs  = klines.map(k => parseFloat(k[2]));
+    const lows   = klines.map(k => parseFloat(k[3]));
+    const closes = klines.map(k => parseFloat(k[4]));
+    const last   = klines.length - 1;
+
+    // Signal 1: RSI(7)
+    const rsiVal = calcRSI(closes, 7);
+    let rsiSig = null;
+    if (rsiVal !== null) {
+      if (rsiVal < 22) rsiSig = 'YES';       // oversold
+      else if (rsiVal > 78) rsiSig = 'NO';   // overbought
+    }
+
+    // Signal 2: Bollinger Band touch (20,2)
+    const bb    = calcBB(closes, 20, 2);
+    const price = closes[last];
+    let bbSig   = null;
+    if (bb) {
+      if (price <= bb.lower) bbSig = 'YES';
+      else if (price >= bb.upper) bbSig = 'NO';
+    }
+
+    // Signal 3: Rejection wick (last candle)
+    const open      = opens[last];
+    const high      = highs[last];
+    const low       = lows[last];
+    const close     = closes[last];
+    const body      = Math.abs(close - open);
+    const range     = high - low;
+    const lowerWick = Math.min(open, close) - low;
+    const upperWick = high - Math.max(open, close);
+    let wickSig     = null;
+    if (range > 0) {
+      if (lowerWick > body * 2 && lowerWick > range * 0.6) wickSig = 'YES'; // hammer
+      else if (upperWick > body * 2 && upperWick > range * 0.6) wickSig = 'NO'; // shooting star
+    }
+
+    // Voting
+    const yesVotes = [rsiSig, bbSig, wickSig].filter(v => v === 'YES').length;
+    const noVotes  = [rsiSig, bbSig, wickSig].filter(v => v === 'NO').length;
+    let direction, confidence;
+    if (yesVotes >= 2) {
+      direction  = 'YES';
+      confidence = yesVotes / 3;
+    } else if (noVotes >= 2) {
+      direction  = 'NO';
+      confidence = noVotes / 3;
+    } else {
+      direction  = Math.random() < 0.5 ? 'YES' : 'NO';
+      confidence = 0.33;
+    }
+
+    return { direction, confidence, rsiSig, bbSig, wickSig };
+  } catch (err) {
+    logger.warn(`[V2] Advanced signal error: ${err.message} — using random fallback`);
+    return {
+      direction:  Math.random() < 0.5 ? 'YES' : 'NO',
+      confidence: 0.33,
+      rsiSig:     null,
+      bbSig:      null,
+      wickSig:    null,
+    };
+  }
+}
 
 // ── Balance alert check ───────────────────────────────────────
 async function checkBalanceAlert() {
@@ -81,7 +228,7 @@ async function checkBalanceAlert() {
         ));
       }
     } else {
-      balanceAlertFired = false; // reset so next crossing fires again
+      balanceAlertFired = false;
     }
   } catch (err) {
     logger.warn(`[Balance] Check failed: ${err.message}`);
@@ -122,7 +269,6 @@ async function getLLMSide(marketName, mid, orderbookSignal) {
     const data = await res.json();
     const text = (data?.choices?.[0]?.message?.content ?? '').trim().toUpperCase();
     if (text === 'YES' || text === 'NO') return text;
-    // try extracting first word if model added extra tokens
     const match = text.match(/\b(YES|NO)\b/);
     return match ? match[1] : null;
   } catch (err) {
@@ -149,8 +295,7 @@ async function getSmartSide(client, market) {
     logger.warn(`[Smart] Midpoint failed: ${err.message} — using 0.5`);
   }
 
-  let orderbookSide;
-  let orderbookSignal;
+  let orderbookSide, orderbookSignal;
   if (mid < 0.48) {
     orderbookSide   = 'NO';
     orderbookSignal = `YES=${mid.toFixed(3)} (cheap) → market expects DOWN`;
@@ -162,24 +307,20 @@ async function getSmartSide(client, market) {
     orderbookSignal = `YES=${mid.toFixed(3)} (neutral 0.48-0.52) → random ${orderbookSide}`;
   }
 
-  // Signal 2: LLM
   const llmSide = await getLLMSide(market.question, mid, orderbookSignal);
 
-  // Signal 3: Extreme price contrarian
   let extremeSide = null;
   if (mid < 0.25) {
-    extremeSide = 'YES'; // market too pessimistic, expect rebound
+    extremeSide = 'YES';
   } else if (mid > 0.75) {
-    extremeSide = 'NO';  // market too optimistic, expect correction
+    extremeSide = 'NO';
   }
 
-  // Majority vote across all 3 signals
   const signals  = [orderbookSide, llmSide, extremeSide].filter(s => s !== null);
   const yesCount = signals.filter(s => s === 'YES').length;
   const noCount  = signals.filter(s => s === 'NO').length;
 
-  let finalSide;
-  let reason;
+  let finalSide, reason;
   if (yesCount > noCount) {
     finalSide = 'YES';
     reason    = `${yesCount}v${noCount} majority`;
@@ -191,7 +332,7 @@ async function getSmartSide(client, market) {
     reason    = `${yesCount}v${noCount} tie → orderbook`;
   }
 
-  logger.info(`[Smart] Orderbook=${orderbookSide} LLM=${llmSide ?? 'null'} Extreme=${extremeSide ?? 'null'} → ${reason} → BET ${finalSide}`);
+  logger.info(`[Smart] Orderbook=${orderbookSide} LLM=${llmSide ?? 'null'} Extreme=${extremeSide ?? 'null'} → ${reason} → ${finalSide}`);
   return finalSide;
 }
 
@@ -206,7 +347,6 @@ async function placeBuy(client, market, betSize, side) {
   if (CFG.dryRun) {
     const mockPrice  = 0.97;
     const mockShares = Math.ceil((betSize / mockPrice) * 100) / 100;
-    
     return { fillPrice: mockPrice, shares: mockShares };
   }
 
@@ -261,9 +401,6 @@ async function placeBuy(client, market, betSize, side) {
 }
 
 // ── Wait for outcome ──────────────────────────────────────────
-// Runs a blocking monitoring loop every 10s until market closes.
-// Returns { exitPrice, pnl } or { exitPrice, pnl: 0, pending: true } when
-// market is closing and resolution will be handled by the redeemer.
 async function waitForOutcome(client, market, entryPrice, betSize, shares, side) {
   const targetPrice = entryPrice * 1.10;
   const tokenId = side === 'YES' ? market.yesTokenId : market.noTokenId;
@@ -286,7 +423,6 @@ async function waitForOutcome(client, market, entryPrice, betSize, shares, side)
       mid = parseFloat(result?.mid ?? result ?? '0') || 0;
     } catch(e) {}
 
-    // Early exit: attempt limit sell when <= 60s left and price is profitable
     if (!earlyExitAttempted && msLeft <= 60000 && mid > entryPrice * 1.02 && !CFG.dryRun) {
       earlyExitAttempted = true;
       try {
@@ -317,13 +453,68 @@ async function waitForOutcome(client, market, entryPrice, betSize, shares, side)
     }
 
     logger.info(`[Martingale] mid=$${mid.toFixed(3)} | target=$${targetPrice.toFixed(3)} | sisa ${Math.round(msLeft/1000)}s`);
-
     await new Promise(r => setTimeout(r, 10000));
+  }
+}
+
+// ── [V2 L4] Apply circuit breaker after a loss ───────────────
+async function applyCircuitBreaker() {
+  let pauseMs    = null;
+  let pauseLabel = null;
+  if (consecutiveLosses === 3)      { pauseMs = 5 * 60 * 1000;      pauseLabel = '5min'; }
+  else if (consecutiveLosses === 4) { pauseMs = 15 * 60 * 1000;     pauseLabel = '15min'; }
+  else if (consecutiveLosses === 5) { pauseMs = 60 * 60 * 1000;     pauseLabel = '1hr'; }
+  else if (consecutiveLosses >= 6)  { pauseMs = 24 * 60 * 60 * 1000; pauseLabel = '24hrs'; }
+
+  if (pauseMs !== null) {
+    pauseUntil   = Date.now() + pauseMs;
+    pauseIsDaily = false;
+    logger.warn(`[V2] Circuit breaker — ${consecutiveLosses} consecutive losses → pause ${pauseLabel}`);
+    await safeNotify(() => sendMessage(
+      `⏸ <b>CIRCUIT BREAKER</b>\n` +
+      `Consecutive losses: ${consecutiveLosses}\n` +
+      `Pausing for: ${pauseLabel}`,
+    ));
+  }
+}
+
+// ── [V2 L5] Check daily loss limit ───────────────────────────
+async function checkDailyLossLimit() {
+  if (startingBalance === null) return;
+  const limit = -(startingBalance * 0.20);
+  if (dailyPnl <= limit) {
+    const midnight = new Date();
+    midnight.setUTCHours(24, 0, 0, 0);
+    pauseUntil   = midnight.getTime();
+    pauseIsDaily = true;
+    logger.warn(`[V2] Daily loss limit hit: pnl=$${dailyPnl.toFixed(2)} limit=$${limit.toFixed(2)}`);
+    await safeNotify(() => sendMessage(
+      `🛑 <b>DAILY LOSS LIMIT</b>\n` +
+      `Lost 20% today.\n` +
+      `Bot paused until 00:00 UTC`,
+    ));
   }
 }
 
 // ── Handler for each new market ───────────────────────────────
 async function onNewMarket(market) {
+  // ── [V2 L1] Daily reset & session filter ─────────────────
+  checkDailyReset();
+  const session = getSessionInfo();
+  logger.info(`[Session] ${session.label} | Trades today: ${dailyTradeCount}/${session.maxTrades}`);
+
+  if (dailyTradeCount >= session.maxTrades) {
+    logger.warn(`[Session] ${session.label} trade limit reached (${dailyTradeCount}/${session.maxTrades}) — skip`);
+    return;
+  }
+
+  // ── [V2 L4] Circuit breaker pause check ──────────────────
+  if (pauseUntil && Date.now() < pauseUntil) {
+    const remainingMin = Math.ceil((pauseUntil - Date.now()) / 60000);
+    logger.warn(`[V2] Circuit breaker active — ${remainingMin}min remaining`);
+    return;
+  }
+
   if (isProcessing) {
     logger.warn('[Martingale] Still processing — skip');
     return;
@@ -343,7 +534,7 @@ async function onNewMarket(market) {
   logger.info(`[Martingale] Asset: ${(market.asset ?? 'BTC').toUpperCase()} | Time left: ${Math.round(msLeft / 1000)}s`);
 
   try {
-    // Wait up to 120s for redeemer to settle any open positions before placing new bet
+    // Wait up to 120s for redeemer to settle any open positions
     if (getOpenPositions().length > 0) {
       logger.info('[Martingale] Waiting for previous position to settle...');
       for (let i = 0; i < 24; i++) {
@@ -353,17 +544,42 @@ async function onNewMarket(market) {
       }
     }
 
-    const side    = await getSmartSide(client, market);
-    const betSize = calcNextBetSize(CFG, state);
-    logger.info(`[Martingale] Bet: $${betSize.toFixed(2)} | Side: ${side}`);
+    // ── [V2 L2] Advanced signal (RSI + BB + Wick) ──────────
+    const [advSignal, smartSide] = await Promise.all([
+      getAdvancedSignal(activeAsset),
+      getSmartSide(client, market),
+    ]);
 
-    const result = await placeBuy(client, market, betSize, side);
-    if (result?.skipped) {
+    // ── [V2 L3] Confidence threshold → combine signals ─────
+    const threshold = getConfidenceThreshold(session, state.step);
+    let finalSide;
+    if (advSignal.confidence >= threshold) {
+      // Combine advanced direction + smart side for final vote
+      const yesC = [advSignal.direction, smartSide].filter(v => v === 'YES').length;
+      const noC  = [advSignal.direction, smartSide].filter(v => v === 'NO').length;
+      if (yesC > noC)      finalSide = 'YES';
+      else if (noC > yesC) finalSide = 'NO';
+      else                 finalSide = advSignal.direction; // tie → advanced wins
+    } else {
+      finalSide = smartSide; // confidence too low → existing signals only
+    }
+
+    logger.info(
+      `[V2] Session=${session.label} Trades=${dailyTradeCount}/${session.maxTrades} | ` +
+      `RSI=${advSignal.rsiSig ?? 'null'} BB=${advSignal.bbSig ?? 'null'} Wick=${advSignal.wickSig ?? 'null'} | ` +
+      `Conf=${advSignal.confidence.toFixed(2)} (min=${threshold.toFixed(2)}) → BET ${finalSide}`,
+    );
+
+    const betSize = calcNextBetSize(CFG, state);
+    logger.info(`[Martingale] Bet: $${betSize.toFixed(2)} | Side: ${finalSide} | Step: ${state.step}`);
+
+    const buyResult = await placeBuy(client, market, betSize, finalSide);
+    if (buyResult?.skipped) {
       logger.warn('[Martingale] Skipped — market minimum shares too high');
       isProcessing = false;
       return;
     }
-    if (!result) {
+    if (!buyResult) {
       let balance = null;
       try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
       if (balance !== null && balance < betSize) {
@@ -383,11 +599,13 @@ async function onNewMarket(market) {
       return;
     }
 
-    const { fillPrice, shares } = result;
+    // ── [V2 L1] Count trade ─────────────────────────────────
+    dailyTradeCount++;
 
-    // Record position so the redeemer can auto-claim USDC after resolution
+    const { fillPrice, shares } = buyResult;
+
     if (market.conditionId) {
-      const tokenId = side === 'YES' ? market.yesTokenId : market.noTokenId;
+      const tokenId = finalSide === 'YES' ? market.yesTokenId : market.noTokenId;
       addPosition({
         conditionId: market.conditionId,
         tokenId,
@@ -395,56 +613,69 @@ async function onNewMarket(market) {
         shares,
         avgBuyPrice: fillPrice,
         totalCost:   betSize,
-        outcome:     side,
+        outcome:     finalSide,
       });
     }
 
-    // Block here — monitoring loop runs until market closes
-    const outcome = await waitForOutcome(client, market, fillPrice, betSize, shares, side);
+    const outcome = await waitForOutcome(client, market, fillPrice, betSize, shares, finalSide);
 
     if (outcome.pending) {
-      // Market closed — redeemer will handle WIN/LOSS via checkAndRedeemPositions
       logger.info('[Martingale] Outcome pending — redeemer will settle this round');
       isProcessing = false;
       return;
+    }
+
+    const { pnl } = outcome;
+    const result   = pnl > 0 ? 'win' : 'loss';
+    const newState = registerOutcome(CFG, state, result, pnl, market.conditionId ?? 'unknown');
+    printSummary(newState, CFG);
+
+    const totalPnl = (newState.history ?? []).reduce((acc, h) => acc + (h.pnl ?? 0), 0);
+    const nextBet  = CFG.baseSize * Math.pow(CFG.multiplier, newState.step);
+
+    let balance = null;
+    try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
+
+    if (result === 'win') {
+      // ── [V2 L4] Reset circuit breaker on win ─────────────
+      consecutiveLosses    = 0;
+      consecutiveLossesAtMax = 0;
+      await safeNotify(() => notifyWin({ market: market.question, pnl, step: newState.step, totalPnl, balance }));
+      await checkBalanceAlert();
     } else {
-      const { pnl } = outcome;
-      // Register outcome and update martingale step
-      const result   = pnl > 0 ? 'win' : 'loss';
-      const newState = registerOutcome(CFG, state, result, pnl, market.conditionId ?? 'unknown');
-      printSummary(newState, CFG);
+      // ── [V2 L4+L5] Track loss ─────────────────────────────
+      consecutiveLosses++;
+      dailyPnl += pnl; // pnl is negative
 
-      const totalPnl = (newState.history ?? []).reduce((acc, h) => acc + (h.pnl ?? 0), 0);
-      const nextBet  = CFG.baseSize * Math.pow(CFG.multiplier, newState.step);
+      logger.info(`[V2] Loss #${consecutiveLosses} | dailyPnl=$${dailyPnl.toFixed(2)}`);
 
-      let balance = null;
-      try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
-      if (result === 'win') {
-        consecutiveLossesAtMax = 0;
-        await safeNotify(() => notifyWin({ market: market.question, pnl, step: newState.step, totalPnl, balance }));
-        await checkBalanceAlert();
-      } else {
-        if (state.step >= CFG.maxSteps) {
-          consecutiveLossesAtMax++;
-          if (consecutiveLossesAtMax >= 2) {
-            consecutiveLossesAtMax = 0;
-            const maxBet    = CFG.baseSize * Math.pow(CFG.multiplier, CFG.maxSteps);
-            const resetState = { step: 0, currentSize: null, history: newState.history };
-            saveMartingaleState(resetState);
-            await safeNotify(() => sendMessage(
-              `🔄 <b>AUTO RESET</b>\n` +
-              `Lost 2x at max step ($${maxBet.toFixed(2)})\n` +
-              `Resetting to step 0, bet $${CFG.baseSize.toFixed(2)}\n` +
-              `Total PnL: $${totalPnl.toFixed(2)}`,
-            ));
-          } else {
-            await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
-          }
-        } else {
+      // Existing auto-reset at max step
+      if (state.step >= CFG.maxSteps) {
+        consecutiveLossesAtMax++;
+        if (consecutiveLossesAtMax >= 2) {
           consecutiveLossesAtMax = 0;
+          const maxBet     = CFG.baseSize * Math.pow(CFG.multiplier, CFG.maxSteps);
+          const resetState = { step: 0, currentSize: null, history: newState.history };
+          saveMartingaleState(resetState);
+          await safeNotify(() => sendMessage(
+            `🔄 <b>AUTO RESET</b>\n` +
+            `Lost 2x at max step ($${maxBet.toFixed(2)})\n` +
+            `Resetting to step 0, bet $${CFG.baseSize.toFixed(2)}\n` +
+            `Total PnL: $${totalPnl.toFixed(2)}`,
+          ));
+        } else {
           await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
         }
+      } else {
+        consecutiveLossesAtMax = 0;
+        await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
       }
+
+      // Circuit breaker (after Telegram loss notification)
+      await applyCircuitBreaker();
+
+      // Daily loss limit check
+      await checkDailyLossLimit();
     }
 
   } catch (err) {
@@ -453,7 +684,7 @@ async function onNewMarket(market) {
   } finally {
     isProcessing = false;
     if (pendingAsset) {
-      activeAsset = pendingAsset;
+      activeAsset  = pendingAsset;
       pendingAsset = null;
       config.mmAssets = [activeAsset];
       logger.info(`[Martingale] Switched to ${activeAsset.toUpperCase()}`);
@@ -512,6 +743,7 @@ async function sendMorningBriefing() {
     const openCount = getOpenPositions().length;
     const nextBet   = CFG.baseSize * Math.pow(CFG.multiplier, s.step);
     const sideLine  = sideMode === 'yes' ? 'FORCE YES' : sideMode === 'no' ? 'FORCE NO' : 'AUTO';
+    const session   = getSessionInfo();
 
     const date = new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Jakarta', day: '2-digit', month: 'short', year: 'numeric' });
 
@@ -533,7 +765,8 @@ async function sendMorningBriefing() {
       `<b>Current Status:</b>\n` +
       `📂 Open Positions: ${openCount}\n` +
       `🎯 Current Step: ${s.step}/${CFG.maxSteps}\n` +
-      `🤖 Asset: ${activeAsset.toUpperCase()} | Mode: ${sideLine}`,
+      `🤖 Asset: ${activeAsset.toUpperCase()} | Mode: ${sideLine}\n` +
+      `🕐 Session: ${session.label}`,
     );
     logger.info('[Martingale] Morning briefing sent');
   } catch (err) {
@@ -545,7 +778,6 @@ function startMorningBriefing() {
   let lastFiredDate = null;
   setInterval(() => {
     const now = new Date();
-    // Fire at 00:00 UTC (07:00 WIB)
     if (now.getUTCHours() === 0 && now.getUTCMinutes() === 0) {
       const today = now.toISOString().slice(0, 10);
       if (lastFiredDate !== today) {
@@ -572,7 +804,7 @@ async function shutdown(reason = 'SIGINT') {
 // ── Main ──────────────────────────────────────────────────────
 async function main() {
   logger.info('══════════════════════════════════════════════════');
-  logger.info('  Polymarket Terminal — MARTINGALE BOT');
+  logger.info('  Polymarket Terminal — MARTINGALE BOT V2');
   logger.info(`  Mode     : ${CFG.dryRun ? 'DRY RUN' : 'LIVE TRADING'}`);
   logger.info(`  Asset    : ${CFG.assets.join(', ').toUpperCase()}`);
   logger.info(`  Duration : ${CFG.duration}`);
@@ -585,8 +817,22 @@ async function main() {
   const client             = await initClient();
   global._martingaleClient = client;
 
+  // ── [V2 L5] Fetch starting balance for daily loss limit ───
+  try {
+    startingBalance = await getUsdcBalance();
+    logger.info(`[V2] Starting balance: $${startingBalance.toFixed(2)} (20% loss limit: $${(startingBalance * 0.20).toFixed(2)})`);
+  } catch (err) {
+    logger.warn(`[V2] Could not fetch starting balance: ${err.message}`);
+  }
+
+  // Init daily reset date
+  lastResetDate = new Date().toISOString().slice(0, 10);
+
   const state = loadMartingaleState();
   printSummary(state, CFG);
+
+  const session = getSessionInfo();
+  logger.info(`[V2] Session: ${session.label} | maxTrades=${session.maxTrades} | confMin=${session.confidenceMin}`);
 
   await startPolling(async (cmd) => {
     const s        = loadMartingaleState();
@@ -603,15 +849,23 @@ async function main() {
       const sideLine = sideMode === 'yes' ? 'FORCE YES'
                      : sideMode === 'no'  ? 'FORCE NO'
                      : 'AUTO';
+      const sess     = getSessionInfo();
+      const pauseLine = (pauseUntil && Date.now() < pauseUntil)
+        ? `\nPaused    : ${Math.ceil((pauseUntil - Date.now()) / 60000)}min remaining`
+        : '';
       await sendMessage(
-        `<b>Martingale Status</b>\n` +
+        `<b>Martingale V2 Status</b>\n` +
         `Mode      : ${CFG.dryRun ? 'DRY RUN' : 'LIVE'}\n` +
         assetLine +
         `Side mode : ${sideLine}\n` +
         `Step      : ${s.step} / ${CFG.maxSteps}\n` +
         `Next bet  : $${nextBet.toFixed(2)}\n` +
         `Wins      : ${wins} | Losses: ${losses}\n` +
-        `Total PnL : $${totalPnl.toFixed(2)}`,
+        `Total PnL : $${totalPnl.toFixed(2)}\n` +
+        `Session   : ${sess.label} | Trades: ${dailyTradeCount}/${sess.maxTrades}\n` +
+        `Daily PnL : $${dailyPnl.toFixed(2)}\n` +
+        `Streak    : ${consecutiveLosses} losses` +
+        pauseLine,
       );
     } else if (cmd === '/asset') {
       const msg = pendingAsset
@@ -664,13 +918,18 @@ async function main() {
       await sendMessage('✅ Mode: FORCE NO — bot will always bet NO');
     } else if (cmd === '/auto') {
       sideMode = 'auto';
-      await sendMessage('✅ Mode: AUTO — bot will use 3-signal analysis');
+      await sendMessage('✅ Mode: AUTO — bot will use V2 signal analysis');
     } else if (cmd === '/reset') {
       const emptyState = { step: 0, currentSize: null, history: [] };
       fs.writeFileSync('data/martingale-state.json', JSON.stringify(emptyState, null, 2));
       fs.writeFileSync('data/positions.json', JSON.stringify({}));
       consecutiveLossesAtMax = 0;
-      await sendMessage('✅ State reset! Step: 0, PnL: $0.00');
+      consecutiveLosses      = 0;
+      dailyTradeCount        = 0;
+      dailyPnl               = 0;
+      pauseUntil             = null;
+      pauseIsDaily           = false;
+      await sendMessage('✅ State reset! Step: 0, PnL: $0.00, V2 counters cleared');
     } else if (cmd === '/stop') {
       if (isShuttingDown) return;
       isShuttingDown = true;
