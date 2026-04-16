@@ -44,6 +44,14 @@ config.mmDuration = CFG.duration;
 let activeAsset = CFG.assets[0] ?? 'btc';
 let pendingAsset = null;
 let sideMode = 'auto'; // 'auto' | 'yes' | 'no'
+let betMode = 'martingale'; // 'martingale' | 'flat'
+let recentBets = []; // last 3 bet directions for reversal detection
+
+// ── Multi-market manual mode ──────────────────────────────────
+let tradingMode = 'btc'; // 'btc' | 'sports' | 'politics'
+let searchResults = []; // store search results
+let selectedMarket = null; // market chosen by user
+let llmRecommendation = null; // LLM analysis result
 
 const ASSET_BINANCE = { btc: 'BTCUSDT', sol: 'SOLUSDT', eth: 'ETHUSDT', xrp: 'XRPUSDT', doge: 'DOGEUSDT' };
 
@@ -60,6 +68,7 @@ async function safeNotify(fn) {
 const BALANCE_ALERT_THRESHOLD = parseFloat(process.env.BALANCE_ALERT_THRESHOLD ?? '25');
 let balanceAlertFired = false;
 
+let flatBetSize    = 1; // default $1, only used in flat mode
 let isProcessing   = false;
 let isShuttingDown = false;
 let redeemerTimer  = null;
@@ -87,22 +96,51 @@ function checkDailyReset() {
       pauseIsDaily = false;
     }
     logger.info(`[V2] Daily reset — date=${today} trades=0 pnl=$0 consecutiveLosses=0`);
+    updateCircuitBreakerState();
   }
 }
+
+// ── [Fix 1] Persist circuit breaker state to shared file ──────
+function updateCircuitBreakerState() {
+  try {
+    fs.writeFileSync('data/circuit-breaker.json', JSON.stringify({
+      consecutiveLosses,
+      pauseUntil,
+      updatedAt: new Date().toISOString(),
+    }, null, 2));
+  } catch (err) {
+    logger.warn(`[CircuitBreaker] Failed to save state: ${err.message}`);
+  }
+}
+
+// ── Dashboard data writer ─────────────────────────────────────
+function writeDashboardData(updates) {
+  try {
+    let current = {};
+    try { current = JSON.parse(fs.readFileSync('data/dashboard.json', 'utf8')); } catch { /* first write */ }
+    const merged = { ...current, ...updates, updatedAt: new Date().toISOString() };
+    fs.writeFileSync('data/dashboard.json', JSON.stringify(merged, null, 2));
+  } catch (err) {
+    logger.warn(`[Dashboard] Write failed: ${err.message}`);
+  }
+}
+
+// ── [Improvement 5] Global daily trade limit ──────────────────
+const MAX_DAILY_TRADES = 80;
 
 // ── [V2 L1] Session info ──────────────────────────────────────
 function getSessionInfo() {
   const h = new Date().getUTCHours();
-  if (h >= 1 && h < 7)  return { label: 'PRIME',      maxTrades: 50, confidenceMin: 0.55 };
-  if (h >= 7 && h < 13) return { label: 'OKAY',       maxTrades: 15, confidenceMin: 0.65 };
-  return                       { label: 'RESTRICTED', maxTrades: 10, confidenceMin: 0.75 };
+  if (h >= 1 && h < 7)  return { label: 'PRIME',      confidenceMin: 0.33 };
+  if (h >= 7 && h < 13) return { label: 'OKAY',       confidenceMin: 0.55 };
+  return                       { label: 'RESTRICTED', confidenceMin: 0.65 };
 }
 
 // ── [V2 L3] Confidence threshold by session + step ────────────
 function getConfidenceThreshold(session, step) {
   if (step === 0) return session.confidenceMin;
   // Recovery steps (step >= 1) require higher confidence
-  const recovery = { PRIME: 0.70, OKAY: 0.75, RESTRICTED: 0.80 };
+  const recovery = { PRIME: 0.65, OKAY: 0.67, RESTRICTED: 0.67 };
   return recovery[session.label];
 }
 
@@ -195,21 +233,87 @@ async function getAdvancedSignal(asset) {
       direction  = 'NO';
       confidence = noVotes / 3;
     } else {
-      direction  = Math.random() < 0.5 ? 'YES' : 'NO';
+      direction  = null;
       confidence = 0.33;
     }
 
     return { direction, confidence, rsiSig, bbSig, wickSig };
   } catch (err) {
-    logger.warn(`[V2] Advanced signal error: ${err.message} — using random fallback`);
+    logger.warn(`[V2] Advanced signal error: ${err.message} — no advanced signal`);
     return {
-      direction:  Math.random() < 0.5 ? 'YES' : 'NO',
+      direction:  null,
       confidence: 0.33,
       rsiSig:     null,
       bbSig:      null,
       wickSig:    null,
     };
   }
+}
+
+// ── [Improvement 2] Volume spike filter ──────────────────────
+async function getVolumeFilter(asset) {
+  const symbol = ASSET_BINANCE[asset] ?? 'BTCUSDT';
+  try {
+    const res = await Promise.race([
+      fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=10`),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Binance timeout')), 5000)),
+    ]);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const klines = await res.json();
+    const volumes = klines.map(k => parseFloat(k[5]));
+    const avgVol = volumes.slice(0, -1).reduce((a, b) => a + b, 0) / (volumes.length - 1);
+    const curVol = volumes[volumes.length - 1];
+    const ratio  = avgVol > 0 ? curVol / avgVol : 1;
+    if (ratio > 2.5) {
+      logger.warn(`[Volume] ⚠️ Volume spike (${ratio.toFixed(1)}x avg) — signal less reliable`);
+    } else {
+      logger.info(`[Volume] Normal (${ratio.toFixed(1)}x avg)`);
+    }
+    return { spike: ratio > 2.5, ratio };
+  } catch (err) {
+    logger.warn(`[Volume] Filter error: ${err.message}`);
+    return { spike: false, ratio: 1 };
+  }
+}
+
+// ── [Improvement 3] Spread analysis ──────────────────────────
+async function getSpreadAnalysis(client, market) {
+  try {
+    const [yesMidRes, noMidRes] = await Promise.all([
+      Promise.race([
+        client.getMidpoint(market.yesTokenId),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
+      ]),
+      Promise.race([
+        client.getMidpoint(market.noTokenId),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
+      ]),
+    ]);
+    const yesMid = parseFloat(yesMidRes?.mid ?? yesMidRes ?? '0.5') || 0.5;
+    const noMid  = parseFloat(noMidRes?.mid  ?? noMidRes  ?? '0.5') || 0.5;
+    const spread = Math.abs(yesMid + noMid - 1.0);
+    if (spread > 0.08) {
+      logger.warn(`[Spread] ⚠️ Wide spread: ${spread.toFixed(3)} — liquidity poor`);
+    } else {
+      logger.info(`[Spread] OK: ${spread.toFixed(3)}`);
+    }
+    return { spread, wide: spread > 0.08 };
+  } catch (err) {
+    logger.warn(`[Spread] Analysis error: ${err.message}`);
+    return { spread: 0, wide: false };
+  }
+}
+
+// ── [Feature 3] Reversal signal ───────────────────────────────
+function getReversalSignal(mid, history) {
+  if (history.length >= 3) {
+    const last3 = history.slice(-3);
+    if (last3.every(s => s === 'YES') && mid > 0.55) return 'NO';
+    if (last3.every(s => s === 'NO') && mid < 0.45) return 'YES';
+  }
+  if (mid > 0.70) return 'NO';
+  if (mid < 0.30) return 'YES';
+  return null;
 }
 
 // ── Balance alert check ───────────────────────────────────────
@@ -235,6 +339,72 @@ async function checkBalanceAlert() {
   }
 }
 
+// ── LLM model rotation ────────────────────────────────────────
+const LLM_MODELS = [
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'google/gemma-3-27b-it:free',
+  'openrouter/free',
+  'mistralai/mistral-small-3.1-24b-instruct:free',
+  'deepseek/deepseek-r1:free',
+  'nvidia/llama-3.1-nemotron-70b-instruct:free',
+  'microsoft/phi-4-reasoning:free',
+  'allenai/olmo-3.1-32b-think:free',
+  'tngtech/deepseek-r1t-chimera:free',
+  'mistralai/mistral-nemo:free',
+];
+let llmModelIndex  = 0;
+let llmSuccessCount = 0;
+
+/**
+ * Call OpenRouter with automatic fallback on 429/404.
+ * - 429 or 404 → advance to next model immediately and retry
+ * - success    → increment llmSuccessCount; reset to index 0 after 10 successes
+ */
+async function callLLM(apiKey, messages) {
+  const tried = new Set();
+  while (tried.size < LLM_MODELS.length) {
+    const idx   = llmModelIndex % LLM_MODELS.length;
+    const model = LLM_MODELS[idx];
+    if (tried.has(model)) break;
+    tried.add(model);
+
+    try {
+      const res = await Promise.race([
+        fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ model, messages, max_tokens: 5 }),
+        }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('LLM timeout')), 5000)),
+      ]);
+
+      if (res.status === 429 || res.status === 404) {
+        logger.warn(`[AI] Model ${model} returned ${res.status} — switching to next`);
+        llmModelIndex++;
+        continue;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const data = await res.json();
+      llmSuccessCount++;
+      if (llmSuccessCount >= 10) {
+        llmSuccessCount = 0;
+        llmModelIndex   = 0;
+        logger.info('[AI] 10 successes — reset model to index 0 (openrouter/free)');
+      }
+      logger.info(`[AI] Model used: ${model} (index ${idx})`);
+      return data;
+    } catch (err) {
+      logger.warn(`[AI] Model ${model} error: ${err.message}`);
+      llmModelIndex++;
+    }
+  }
+  return null;
+}
+
 // ── LLM side suggestion via OpenRouter ───────────────────────
 async function getLLMSide(marketName, mid, orderbookSignal) {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -249,24 +419,8 @@ async function getLLMSide(marketName, mid, orderbookSignal) {
     `Reply with ONLY one word: YES or NO`;
 
   try {
-    const res = await Promise.race([
-      fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'qwen/qwen3.6-plus:free',
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 5,
-        }),
-      }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('LLM timeout')), 5000)),
-    ]);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await callLLM(apiKey, [{ role: 'user', content: prompt }]);
+    if (!data) return null;
     const text = (data?.choices?.[0]?.message?.content ?? '').trim().toUpperCase();
     if (text === 'YES' || text === 'NO') return text;
     const match = text.match(/\b(YES|NO)\b/);
@@ -277,10 +431,127 @@ async function getLLMSide(marketName, mid, orderbookSignal) {
   }
 }
 
+// ── [Feature 4] LLM recovery suggestion after a loss ─────────
+async function getLLMRecovery(lastLoss, currentMarket, mid) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey || !lastLoss) return null;
+
+  const prompt =
+    `Previous bet LOST: ${lastLoss.market ?? 'unknown'}, Side: ${lastLoss.side ?? 'unknown'}, PnL: ${(lastLoss.pnl ?? 0).toFixed(2)}\n` +
+    `Current market: ${currentMarket}\n` +
+    `YES price: ${mid.toFixed(3)}\n` +
+    `What side should I bet to recover? Reply YES or NO`;
+
+  try {
+    const data = await callLLM(apiKey, [{ role: 'user', content: prompt }]);
+    if (!data) return null;
+    const text = (data?.choices?.[0]?.message?.content ?? '').trim().toUpperCase();
+    if (text === 'YES' || text === 'NO') return text;
+    const match = text.match(/\b(YES|NO)\b/);
+    return match ? match[1] : null;
+  } catch (err) {
+    logger.warn(`[Learn] LLM recovery request failed: ${err.message}`);
+    return null;
+  }
+}
+
+// ── [Fix 3] Price action following signal ─────────────────────
+async function getPriceActionSignal(market) {
+  try {
+    // Get market start time (eventStartTime)
+    const marketStart = new Date(market.eventStartTime ?? market.startTime).getTime();
+    const now = Date.now();
+    const elapsed = (now - marketStart) / 1000; // seconds elapsed
+
+    // Only use this signal if market has been open > 90 seconds
+    if (elapsed < 90) {
+      logger.info('[PriceAction] Market too new (<90s) — skipping');
+      return null;
+    }
+
+    // Fetch 1m candles from Binance (last 5)
+    const symbol = ASSET_BINANCE[activeAsset] ?? 'BTCUSDT';
+    const res = await Promise.race([
+      fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=5`),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+    ]);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const candles = await res.json();
+
+    const currentPrice = parseFloat(candles[candles.length - 1][4]); // last close
+    const openPrice = parseFloat(candles[candles.length - 2][1]); // 1 min ago open
+
+    // Also get price at market open using market eventStartTime
+    // Find the candle closest to market start
+    const startCandle = candles[0];
+    const startPrice = parseFloat(startCandle[1]); // open of oldest candle
+
+    const changeFromStart = ((currentPrice - startPrice) / startPrice) * 100;
+    const changeLastMin = ((currentPrice - openPrice) / openPrice) * 100;
+
+    let signal = null;
+    let reason = '';
+
+    // Strong signal: price moved >0.08% from market open
+    if (changeFromStart > 0.08) {
+      signal = 'YES'; // UP trend
+      reason = `+${changeFromStart.toFixed(3)}% from open → UP`;
+    } else if (changeFromStart < -0.08) {
+      signal = 'NO'; // DOWN trend
+      reason = `${changeFromStart.toFixed(3)}% from open → DOWN`;
+    }
+    // Last minute momentum confirmation
+    else if (changeLastMin > 0.05) {
+      signal = 'YES';
+      reason = `+${changeLastMin.toFixed(3)}% last 1m → UP`;
+    } else if (changeLastMin < -0.05) {
+      signal = 'NO';
+      reason = `${changeLastMin.toFixed(3)}% last 1m → DOWN`;
+    } else {
+      reason = `flat ${changeFromStart.toFixed(3)}% → no signal`;
+    }
+
+    logger.info(`[PriceAction] ${reason} | signal=${signal ?? 'null'}`);
+    return signal;
+
+  } catch (err) {
+    logger.warn(`[PriceAction] Error: ${err.message}`);
+    return null;
+  }
+}
+
+// ── [Fix 3] Momentum signal (5m price change) ────────────────
+async function getMomentumSignal() {
+  try {
+    const symbol = ASSET_BINANCE[activeAsset] ?? 'BTCUSDT';
+    const res = await Promise.race([
+      fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=6`),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+    ]);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const candles = await res.json();
+
+    const closes = candles.map(k => parseFloat(k[4]));
+    const current = closes[closes.length - 1];
+    const prev5 = closes[0];
+    const change = ((current - prev5) / prev5) * 100;
+
+    let signal = null;
+    if (change > 0.1) signal = 'YES';
+    else if (change < -0.1) signal = 'NO';
+
+    logger.info(`[Momentum] ${change.toFixed(3)}% (5m) → ${signal ?? 'null'}`);
+    return signal;
+  } catch (err) {
+    logger.warn(`[Momentum] Error: ${err.message}`);
+    return null;
+  }
+}
+
 // ── Smart side selection via orderbook midpoint + LLM ────────
 async function getSmartSide(client, market) {
-  if (sideMode === 'yes') { logger.info('[Smart] FORCE YES mode'); return 'YES'; }
-  if (sideMode === 'no')  { logger.info('[Smart] FORCE NO mode');  return 'NO';  }
+  if (sideMode === 'yes') { logger.info('[Smart] FORCE YES mode'); return { side: 'YES', mid: 0.5 }; }
+  if (sideMode === 'no')  { logger.info('[Smart] FORCE NO mode');  return { side: 'NO', mid: 0.5 };  }
 
   const yesTokenId = market.yesTokenId;
   let mid = 0.5;
@@ -316,7 +587,27 @@ async function getSmartSide(client, market) {
     extremeSide = 'NO';
   }
 
-  const signals  = [orderbookSide, llmSide, extremeSide].filter(s => s !== null);
+  // [Feature 3] Reversal signal as 4th vote
+  const reversalSig = getReversalSignal(mid, recentBets);
+
+  // New signals
+  const [priceActionSig, momentumSig] = await Promise.all([
+    getPriceActionSignal(market),
+    getMomentumSignal(),
+  ]);
+
+  logger.info(`[Smart] PriceAction=${priceActionSig ?? 'null'} Momentum=${momentumSig ?? 'null'}`);
+
+  // Combine ALL signals
+  const signals = [
+    orderbookSide,
+    llmSide,
+    extremeSide,
+    reversalSig,
+    priceActionSig,
+    momentumSig,
+  ].filter(s => s !== null);
+
   const yesCount = signals.filter(s => s === 'YES').length;
   const noCount  = signals.filter(s => s === 'NO').length;
 
@@ -332,8 +623,8 @@ async function getSmartSide(client, market) {
     reason    = `${yesCount}v${noCount} tie → orderbook`;
   }
 
-  logger.info(`[Smart] Orderbook=${orderbookSide} LLM=${llmSide ?? 'null'} Extreme=${extremeSide ?? 'null'} → ${reason} → ${finalSide}`);
-  return finalSide;
+  logger.info(`[Smart] Orderbook=${orderbookSide} LLM=${llmSide ?? 'null'} Extreme=${extremeSide ?? 'null'} Reversal=${reversalSig ?? 'null'} PriceAction=${priceActionSig ?? 'null'} Momentum=${momentumSig ?? 'null'} → ${reason} → ${finalSide}`);
+  return { side: finalSide, mid, priceActionSig, momentumSig };
 }
 
 // ── Place buy ─────────────────────────────────────────────────
@@ -391,7 +682,6 @@ async function placeBuy(client, market, betSize, side) {
 
     const fillPrice = parseFloat(res.price ?? String(price));
     logger.success(`[Martingale] BUY filled @ $${fillPrice.toFixed(3)}`);
-    safeNotify(() => notifyBuy({ market: market.question, betSize, price: fillPrice, side }));
     return { fillPrice, shares };
 
   } catch (err) {
@@ -469,6 +759,7 @@ async function applyCircuitBreaker() {
   if (pauseMs !== null) {
     pauseUntil   = Date.now() + pauseMs;
     pauseIsDaily = false;
+    updateCircuitBreakerState();
     logger.warn(`[V2] Circuit breaker — ${consecutiveLosses} consecutive losses → pause ${pauseLabel}`);
     await safeNotify(() => sendMessage(
       `⏸ <b>CIRCUIT BREAKER</b>\n` +
@@ -500,18 +791,30 @@ async function checkDailyLossLimit() {
 async function onNewMarket(market) {
   // ── [V2 L1] Daily reset & session filter ─────────────────
   checkDailyReset();
-  const session = getSessionInfo();
-  logger.info(`[Session] ${session.label} | Trades today: ${dailyTradeCount}/${session.maxTrades}`);
 
-  if (dailyTradeCount >= session.maxTrades) {
-    logger.warn(`[Session] ${session.label} trade limit reached (${dailyTradeCount}/${session.maxTrades}) — skip`);
+  // ── Circuit breaker: merge memory + file, take the later pauseUntil ──
+  let effectivePauseUntil = pauseUntil;
+  try {
+    const cb = JSON.parse(fs.readFileSync('data/circuit-breaker.json', 'utf8'));
+    if (typeof cb.consecutiveLosses === 'number') consecutiveLosses = cb.consecutiveLosses;
+    if (cb.pauseUntil && cb.pauseUntil > (effectivePauseUntil ?? 0)) {
+      effectivePauseUntil = cb.pauseUntil;
+      pauseUntil = cb.pauseUntil; // sync memory to file value
+    }
+  } catch { /* file may not exist yet — use in-memory defaults */ }
+
+  if (effectivePauseUntil && Date.now() < effectivePauseUntil) {
+    const remainingMin = Math.ceil((effectivePauseUntil - Date.now()) / 60000);
+    logger.warn(`[Circuit] Paused — ${remainingMin}min remaining`);
+    isProcessing = false;
     return;
   }
 
-  // ── [V2 L4] Circuit breaker pause check ──────────────────
-  if (pauseUntil && Date.now() < pauseUntil) {
-    const remainingMin = Math.ceil((pauseUntil - Date.now()) / 60000);
-    logger.warn(`[V2] Circuit breaker active — ${remainingMin}min remaining`);
+  const session = getSessionInfo();
+  logger.info(`[Session] ${session.label} | Trades today: ${dailyTradeCount}/${MAX_DAILY_TRADES}`);
+
+  if (dailyTradeCount >= MAX_DAILY_TRADES) {
+    logger.warn(`[Daily] Max ${MAX_DAILY_TRADES} trades reached today — skip`);
     return;
   }
 
@@ -528,7 +831,6 @@ async function onNewMarket(market) {
 
   isProcessing = true;
   const client = global._martingaleClient;
-  const state  = loadMartingaleState();
 
   logger.info(`\n[Martingale] ══ "${market.question.slice(0, 50)}" ══`);
   logger.info(`[Martingale] Asset: ${(market.asset ?? 'BTC').toUpperCase()} | Time left: ${Math.round(msLeft / 1000)}s`);
@@ -542,36 +844,126 @@ async function onNewMarket(market) {
         if (getOpenPositions().length === 0) break;
         logger.info('[Martingale] Waiting for previous position to settle...');
       }
+      // If position still open after 120s, skip this round
+      if (getOpenPositions().length > 0) {
+        logger.warn('[Martingale] Position still open after 120s wait — skipping round');
+        isProcessing = false;
+        return;
+      }
     }
 
-    // ── [V2 L2] Advanced signal (RSI + BB + Wick) ──────────
-    const [advSignal, smartSide] = await Promise.all([
+    // Load state AFTER waiting for redeemer to settle previous round —
+    // prevents reading stale step when a pending outcome was just registered.
+    const state = loadMartingaleState();
+    logger.info(`[Martingale] State loaded: step=${state.step}`);
+
+    // ── [Improvement 1] Delayed entry timing ───────────────
+    {
+      const msLeftNow = new Date(market.endTime).getTime() - Date.now();
+      if (msLeftNow > 300000) {
+        const waitMs  = Math.min(60000, msLeftNow - 240000);
+        const waitEnd = Date.now() + waitMs;
+        while (Date.now() < waitEnd) {
+          const remaining = Math.ceil((waitEnd - Date.now()) / 1000);
+          logger.info(`[Entry] Waiting for orderbook to stabilize... ${remaining}s remaining`);
+          await sleep(Math.min(30000, waitEnd - Date.now()));
+        }
+      }
+    }
+
+    // ── [V2 L2] Advanced signal + volume + spread ──────────
+    const [advSignal, smartResult, volumeResult, spreadResult] = await Promise.all([
       getAdvancedSignal(activeAsset),
       getSmartSide(client, market),
+      getVolumeFilter(activeAsset),
+      getSpreadAnalysis(client, market),
     ]);
+    const smartSide = smartResult.side;
+    const marketMid = smartResult.mid;
+    const priceActionSig = smartResult.priceActionSig ?? null;
+    const momentumSig = smartResult.momentumSig ?? null;
+
+    // Apply spread confidence penalty
+    const adjustedConfidence = spreadResult.wide
+      ? Math.max(0, advSignal.confidence - 0.1)
+      : advSignal.confidence;
+
+    // ── [Feature 4] LLM recovery signal on step >= 1 ───────
+    let llmRecoverySide = null;
+    if (state.step >= 1) {
+      const history = state.history ?? [];
+      const lastLoss = [...history].reverse().find(h => h.outcome === 'loss');
+      if (lastLoss) {
+        llmRecoverySide = await getLLMRecovery(lastLoss, market.question, marketMid);
+        logger.info(`[Learn] Previous loss was ${lastLoss.side ?? 'unknown'}, LLM recovery suggestion: ${llmRecoverySide ?? 'null'}`);
+      }
+    }
 
     // ── [V2 L3] Confidence threshold → combine signals ─────
     const threshold = getConfidenceThreshold(session, state.step);
     let finalSide;
-    if (advSignal.confidence >= threshold) {
-      // Combine advanced direction + smart side for final vote
-      const yesC = [advSignal.direction, smartSide].filter(v => v === 'YES').length;
-      const noC  = [advSignal.direction, smartSide].filter(v => v === 'NO').length;
+    if (adjustedConfidence >= threshold) {
+      // Combine advanced direction + smart side + LLM recovery for final vote
+      const votes = [smartSide, llmRecoverySide, advSignal.direction].filter(v => v !== null);
+      const yesC = votes.filter(v => v === 'YES').length;
+      const noC  = votes.filter(v => v === 'NO').length;
       if (yesC > noC)      finalSide = 'YES';
       else if (noC > yesC) finalSide = 'NO';
-      else                 finalSide = advSignal.direction; // tie → advanced wins
+      else                 finalSide = smartSide; // tie → smartSide wins (more reliable)
     } else {
       finalSide = smartSide; // confidence too low → existing signals only
     }
 
+    const betReason = `OB=${smartSide} RSI=${advSignal.rsiSig ?? 'null'} BB=${advSignal.bbSig ?? 'null'} Wick=${advSignal.wickSig ?? 'null'} PA=${priceActionSig ?? 'null'} Mom=${momentumSig ?? 'null'} → BET ${finalSide}`;
     logger.info(
-      `[V2] Session=${session.label} Trades=${dailyTradeCount}/${session.maxTrades} | ` +
-      `RSI=${advSignal.rsiSig ?? 'null'} BB=${advSignal.bbSig ?? 'null'} Wick=${advSignal.wickSig ?? 'null'} | ` +
-      `Conf=${advSignal.confidence.toFixed(2)} (min=${threshold.toFixed(2)}) → BET ${finalSide}`,
+      `[V2] Session=${session.label} Trades=${dailyTradeCount}/${MAX_DAILY_TRADES} | ` +
+      `${betReason} | Conf=${adjustedConfidence.toFixed(2)} (min=${threshold.toFixed(2)})`,
     );
 
-    const betSize = calcNextBetSize(CFG, state);
-    logger.info(`[Martingale] Bet: $${betSize.toFixed(2)} | Side: ${finalSide} | Step: ${state.step}`);
+    // ── Dashboard: write signal snapshot ─────────────────
+    writeDashboardData({
+      lastSignal: {
+        rsi:        advSignal.rsiSig   ?? null,
+        bb:         advSignal.bbSig    ?? null,
+        wick:       advSignal.wickSig  ?? null,
+        llm:        llmRecoverySide    ?? null,
+        orderbook:  smartSide,
+        confidence: adjustedConfidence,
+        side:       finalSide,
+      },
+      session:          session.label,
+      betMode,
+      activeAsset,
+      consecutiveLosses,
+      pauseUntil,
+      dailyTradeCount,
+      dailyPnl,
+    });
+
+    const timeWIB = market.eventStartTime
+      ? new Date(market.eventStartTime).toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' })
+      : new Date().toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' });
+
+    // ── [Feature 1 + Improvement 4] Bet size by mode ───────
+    let betSize;
+    if (betMode === 'flat') {
+      betSize = flatBetSize;
+      logger.info(`[Flat] Betting $${betSize.toFixed(2)} flat — no martingale`);
+    } else if (betMode === 'kelly') {
+      const hist20   = (state.history ?? []).slice(-20);
+      const w20      = hist20.filter(h => h.outcome === 'win').length;
+      const winRate  = hist20.length >= 20 ? w20 / hist20.length : 0.52;
+      let kellyFrac  = winRate - (1 - winRate);
+      kellyFrac      = Math.max(0.05, Math.min(kellyFrac, 0.25));
+      let bal        = null;
+      try { bal = await getUsdcBalance(); } catch { /* non-fatal */ }
+      betSize = bal !== null ? bal * kellyFrac : CFG.baseSize;
+      betSize = Math.max(CFG.baseSize, Math.min(betSize, 10));
+      logger.info(`[Kelly] WinRate=${(winRate * 100).toFixed(0)}% Kelly=${(kellyFrac * 100).toFixed(0)}% Balance=$${(bal ?? 0).toFixed(2)} → Bet=$${betSize.toFixed(2)}`);
+    } else {
+      betSize = calcNextBetSize(CFG, state);
+    }
+    logger.info(`[Martingale] Bet: $${betSize.toFixed(2)} | Side: ${finalSide} | Step: ${state.step} | Mode: ${betMode.toUpperCase()}`);
 
     const buyResult = await placeBuy(client, market, betSize, finalSide);
     if (buyResult?.skipped) {
@@ -602,7 +994,37 @@ async function onNewMarket(market) {
     // ── [V2 L1] Count trade ─────────────────────────────────
     dailyTradeCount++;
 
+    // ── [Feature 3] Track recent bet directions ─────────────
+    recentBets.push(finalSide);
+    if (recentBets.length > 3) recentBets.shift();
+
     const { fillPrice, shares } = buyResult;
+
+    // ── Dashboard: write bet data ─────────────────────────
+    let _balance = null;
+    try { _balance = await getUsdcBalance(); } catch { /* non-fatal */ }
+    writeDashboardData({
+      lastBet: {
+        market: market.question,
+        side:   finalSide,
+        size:   betSize,
+        price:  fillPrice,
+        time:   new Date().toISOString(),
+      },
+      balance:        _balance,
+      dailyTradeCount,
+    });
+
+    // ── Notify buy with full context ────────────────────────
+    safeNotify(() => notifyBuy({
+      market:  market.question,
+      betSize,
+      price:   fillPrice,
+      side:    finalSide,
+      mode:    betMode.toUpperCase(),
+      timeWIB,
+      reason:  betReason,
+    }));
 
     if (market.conditionId) {
       const tokenId = finalSide === 'YES' ? market.yesTokenId : market.noTokenId;
@@ -627,7 +1049,12 @@ async function onNewMarket(market) {
 
     const { pnl } = outcome;
     const result   = pnl > 0 ? 'win' : 'loss';
-    const newState = registerOutcome(CFG, state, result, pnl, market.conditionId ?? 'unknown');
+    let newState = registerOutcome(CFG, state, result, pnl, market.conditionId ?? 'unknown');
+    // ── [Feature 1] Flat/Kelly mode: never change step ─────
+    if (betMode === 'flat' || betMode === 'kelly') {
+      newState = { ...newState, step: 0, currentSize: null };
+      saveMartingaleState(newState);
+    }
     printSummary(newState, CFG);
 
     const totalPnl = (newState.history ?? []).reduce((acc, h) => acc + (h.pnl ?? 0), 0);
@@ -636,16 +1063,26 @@ async function onNewMarket(market) {
     let balance = null;
     try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
 
+    // Read last-claim.json for txHash (set by redeemer after on-chain redemption)
+    let claimTxHash = null;
+    try {
+      const claimData = JSON.parse(fs.readFileSync('data/last-claim.json', 'utf8'));
+      claimTxHash = claimData.txHash ?? null;
+      fs.unlinkSync('data/last-claim.json');
+    } catch { /* file may not exist — non-fatal */ }
+
     if (result === 'win') {
       // ── [V2 L4] Reset circuit breaker on win ─────────────
       consecutiveLosses    = 0;
       consecutiveLossesAtMax = 0;
-      await safeNotify(() => notifyWin({ market: market.question, pnl, step: newState.step, totalPnl, balance }));
+      updateCircuitBreakerState();
+      await safeNotify(() => notifyWin({ market: market.question, pnl, step: newState.step, totalPnl, balance, txHash: claimTxHash }));
       await checkBalanceAlert();
     } else {
       // ── [V2 L4+L5] Track loss ─────────────────────────────
       consecutiveLosses++;
       dailyPnl += pnl; // pnl is negative
+      updateCircuitBreakerState();
 
       logger.info(`[V2] Loss #${consecutiveLosses} | dailyPnl=$${dailyPnl.toFixed(2)}`);
 
@@ -664,11 +1101,11 @@ async function onNewMarket(market) {
             `Total PnL: $${totalPnl.toFixed(2)}`,
           ));
         } else {
-          await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
+          await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance, totalPnl, txHash: claimTxHash }));
         }
       } else {
         consecutiveLossesAtMax = 0;
-        await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance }));
+        await safeNotify(() => notifyLoss({ market: market.question, pnl, newStep: newState.step, nextBet, balance, totalPnl, txHash: claimTxHash }));
       }
 
       // Circuit breaker (after Telegram loss notification)
@@ -677,6 +1114,16 @@ async function onNewMarket(market) {
       // Daily loss limit check
       await checkDailyLossLimit();
     }
+
+    // ── Dashboard: write result snapshot ─────────────────
+    writeDashboardData({
+      lastResult: { outcome: result, pnl, step: newState.step },
+      consecutiveLosses,
+      pauseUntil,
+      dailyPnl,
+      dailyTradeCount,
+      balance,
+    });
 
   } catch (err) {
     logger.error(`[Martingale] Error: ${err.message}`);
@@ -769,6 +1216,15 @@ async function sendMorningBriefing() {
       `🕐 Session: ${session.label}`,
     );
     logger.info('[Martingale] Morning briefing sent');
+
+    // ── [Improvement 6] Auto reset daily counters ──────────
+    dailyTradeCount   = 0;
+    dailyPnl          = 0;
+    consecutiveLosses = 0;
+    pauseUntil        = null;
+    pauseIsDaily      = false;
+    updateCircuitBreakerState();
+    logger.info('[V2] Auto reset triggered by morning briefing');
   } catch (err) {
     logger.warn(`[Martingale] Morning briefing failed: ${err.message}`);
   }
@@ -811,7 +1267,7 @@ async function main() {
   logger.info(`  Side     : ${CFG.side}`);
   logger.info(`  Base     : $${CFG.baseSize} | x${CFG.multiplier} | max step: ${CFG.maxSteps}`);
   logger.info(`  Target   : +${CFG.targetProfitPct}%`);
-  logger.info('  Commands : /status /yes /no /auto /btc /sol /eth /xrp /doge /pnl /reset /stop');
+  logger.info('  Commands : /status /yes /no /auto /btc /sol /eth /xrp /doge /pnl /reset /stop /martingale /flat /kelly /btc5 /btc15');
   logger.info('══════════════════════════════════════════════════');
 
   const client             = await initClient();
@@ -832,7 +1288,7 @@ async function main() {
   printSummary(state, CFG);
 
   const session = getSessionInfo();
-  logger.info(`[V2] Session: ${session.label} | maxTrades=${session.maxTrades} | confMin=${session.confidenceMin}`);
+  logger.info(`[V2] Session: ${session.label} | maxDailyTrades=${MAX_DAILY_TRADES} | confMin=${session.confidenceMin}`);
 
   await startPolling(async (cmd) => {
     const s        = loadMartingaleState();
@@ -853,16 +1309,28 @@ async function main() {
       const pauseLine = (pauseUntil && Date.now() < pauseUntil)
         ? `\nPaused    : ${Math.ceil((pauseUntil - Date.now()) / 60000)}min remaining`
         : '';
+      // Kelly info line
+      let kellyLine = '';
+      if (betMode === 'kelly') {
+        const hist20  = history.slice(-20);
+        const w20     = hist20.filter(h => h.outcome === 'win').length;
+        const winRate = hist20.length >= 20 ? w20 / hist20.length : 0.52;
+        let kf        = winRate - (1 - winRate);
+        kf            = Math.max(0.05, Math.min(kf, 0.25));
+        kellyLine     = `\nKelly     : WinRate=${(winRate * 100).toFixed(0)}% Frac=${(kf * 100).toFixed(0)}%`;
+      }
       await sendMessage(
         `<b>Martingale V2 Status</b>\n` +
         `Mode      : ${CFG.dryRun ? 'DRY RUN' : 'LIVE'}\n` +
         assetLine +
+        `Duration  : ${CFG.duration}\n` +
+        `Bet Mode  : ${betMode === 'flat' ? `FLAT ($${flatBetSize.toFixed(2)})` : betMode.toUpperCase()}${kellyLine}\n` +
         `Side mode : ${sideLine}\n` +
         `Step      : ${s.step} / ${CFG.maxSteps}\n` +
         `Next bet  : $${nextBet.toFixed(2)}\n` +
         `Wins      : ${wins} | Losses: ${losses}\n` +
         `Total PnL : $${totalPnl.toFixed(2)}\n` +
-        `Session   : ${sess.label} | Trades: ${dailyTradeCount}/${sess.maxTrades}\n` +
+        `Session   : ${sess.label} | Trades: ${dailyTradeCount}/${MAX_DAILY_TRADES}\n` +
         `Daily PnL : $${dailyPnl.toFixed(2)}\n` +
         `Streak    : ${consecutiveLosses} losses` +
         pauseLine,
@@ -872,7 +1340,16 @@ async function main() {
         ? `Current: ${activeAsset.toUpperCase()} → Pending: ${pendingAsset.toUpperCase()}`
         : `Current asset: ${activeAsset.toUpperCase()}`;
       await sendMessage(msg);
-    } else if (cmd === '/btc' || cmd === '/sol' || cmd === '/eth' || cmd === '/xrp' || cmd === '/doge') {
+    } else if (cmd === '/btc') {
+      activeAsset = 'btc';
+      CFG.duration = '5m';
+      config.mmDuration = '5m';
+      config.mmAssets = ['btc'];
+      pendingAsset = null;
+      stopMMDetector();
+      startMMDetector(onNewMarket);
+      await sendMessage('✅ Switched to BTC 5m');
+    } else if (cmd === '/sol' || cmd === '/eth' || cmd === '/xrp' || cmd === '/doge') {
       const newAsset = cmd.slice(1);
       if (newAsset === activeAsset && !pendingAsset) {
         await sendMessage(`Already trading ${newAsset.toUpperCase()}`);
@@ -891,25 +1368,16 @@ async function main() {
         await sendMessage(`<b>Last ${last10.length} Trades</b>\n` + lines.join('\n'));
       }
     } else if (cmd === '/start') {
-      exec('pm2 jlist', (err, stdout) => {
-        try {
-          const procs = JSON.parse(stdout || '[]');
-          const proc  = procs.find(p => (p.name ?? p.pm2_env?.name) === 'martingale-bot');
-          if (proc && proc.pm2_env?.status === 'online') {
-            sendMessage('⚠️ Bot is already running');
-          } else {
-            exec('pm2 start martingale-bot', (err2) => {
-              if (err2) {
-                sendMessage(`❌ Failed to start: ${err2.message}`);
-              } else {
-                sendMessage('✅ Bot started successfully');
-              }
-            });
-          }
-        } catch (e) {
-          sendMessage(`❌ Failed: ${e.message}`);
-        }
-      });
+      if (!isShuttingDown) {
+        await sendMessage('⚠️ Bot sudah berjalan!');
+      } else {
+        isShuttingDown = false;
+        stopMMDetector();
+        startMMDetector(onNewMarket);
+        startRedeemerLoop();
+        await sendMessage('✅ Bot dimulai kembali!');
+        logger.info('[Martingale] Bot resumed via /start command');
+      }
     } else if (cmd === '/yes') {
       sideMode = 'yes';
       await sendMessage('✅ Mode: FORCE YES — bot will always bet YES');
@@ -919,6 +1387,45 @@ async function main() {
     } else if (cmd === '/auto') {
       sideMode = 'auto';
       await sendMessage('✅ Mode: AUTO — bot will use V2 signal analysis');
+    } else if (cmd === '/martingale') {
+      betMode = 'martingale';
+      await sendMessage('✅ Bet Mode: MARTINGALE — doubles on loss');
+    } else if (cmd === '/flat') {
+      betMode = 'flat';
+      await sendMessage('✅ Bet Mode: FLAT — always bet $1, no doubling');
+    } else if (cmd === '/kelly') {
+      betMode = 'kelly';
+      await sendMessage('✅ Bet Mode: KELLY — dynamic sizing based on win rate');
+    } else if (cmd === '/bet1') {
+      flatBetSize = 1;
+      await sendMessage('✅ Flat bet size: $1.00');
+    } else if (cmd === '/bet2') {
+      flatBetSize = 2;
+      await sendMessage('✅ Flat bet size: $2.00');
+    } else if (cmd === '/bet3') {
+      flatBetSize = 3;
+      await sendMessage('✅ Flat bet size: $3.00');
+    } else if (cmd === '/bet4') {
+      flatBetSize = 4;
+      await sendMessage('✅ Flat bet size: $4.00');
+    } else if (cmd === '/bet5') {
+      flatBetSize = 5;
+      await sendMessage('✅ Flat bet size: $5.00');
+    } else if (cmd === '/btc15') {
+      activeAsset = 'btc';
+      CFG.duration = '15m';
+      config.mmDuration = '15m';
+      config.mmAssets = ['btc'];
+      stopMMDetector();
+      startMMDetector(onNewMarket);
+      await sendMessage('✅ Switched to BTC 15m market');
+    } else if (cmd === '/btc5') {
+      CFG.duration = '5m';
+      config.mmDuration = '5m';
+      config.mmAssets = [activeAsset];
+      stopMMDetector();
+      startMMDetector(onNewMarket);
+      await sendMessage('✅ Switched to BTC 5m market');
     } else if (cmd === '/reset') {
       const emptyState = { step: 0, currentSize: null, history: [] };
       fs.writeFileSync('data/martingale-state.json', JSON.stringify(emptyState, null, 2));
@@ -929,6 +1436,7 @@ async function main() {
       dailyPnl               = 0;
       pauseUntil             = null;
       pauseIsDaily           = false;
+      updateCircuitBreakerState();
       await sendMessage('✅ State reset! Step: 0, PnL: $0.00, V2 counters cleared');
     } else if (cmd === '/stop') {
       if (isShuttingDown) return;
@@ -939,6 +1447,342 @@ async function main() {
       stopPolling();
       const pmTarget = process.env.name ?? process.env.pm_id ?? 'martingale-bot';
       exec(`pm2 stop ${pmTarget}`, () => process.exit(0));
+    } else if (cmd === '/redeem') {
+      await sendMessage('🔍 Manually triggering checkAndRedeemPositions()...');
+      try {
+        const positions = getOpenPositions();
+        await sendMessage(`Found ${positions.length} open position(s). Starting redemption check...`);
+        await checkAndRedeemPositions();
+        await sendMessage('✅ /redeem complete — check PM2 logs for details.');
+      } catch (err) {
+        logger.error(`[Redeemer] /redeem command error: ${err.message}`);
+        await sendMessage(`❌ /redeem error: ${err.message}`);
+      }
+
+    } else if (cmd === '/dashboard') {
+      const s = loadMartingaleState();
+      const history = s.history ?? [];
+      const wins = history.filter(h => h.outcome === 'win').length;
+      const losses = history.filter(h => h.outcome === 'loss').length;
+      const totalPnl = history.reduce((acc, h) => acc + (h.pnl ?? 0), 0);
+      const winRate = history.length > 0 ? ((wins / history.length) * 100).toFixed(1) : '0.0';
+
+      // Last 5 trades
+      const last5 = history.slice(-5).reverse();
+      let tradesLine = '';
+      if (last5.length === 0) {
+        tradesLine = '└ Belum ada trade\n';
+      } else {
+        last5.forEach((h, i) => {
+          const isLast = i === last5.length - 1;
+          const prefix = isLast ? '└' : '├';
+          const emoji = h.outcome === 'win' ? '✅' : '❌';
+          const pnlStr = h.pnl >= 0 ? '+$' + h.pnl.toFixed(2) : '-$' + Math.abs(h.pnl).toFixed(2);
+          const time = h.ts ? new Date(h.ts).toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' }) : '??:??';
+          tradesLine += `${prefix} ${emoji} ${pnlStr} | Step${h.stepBefore ?? 0} | ${time} WIB\n`;
+        });
+      }
+
+      // Circuit breaker status
+      let cbStatus = '🟢 OFF';
+      let pauseRemaining = '';
+      if (pauseUntil && Date.now() < pauseUntil) {
+        const mins = Math.ceil((pauseUntil - Date.now()) / 60000);
+        cbStatus = `🔴 PAUSED`;
+        pauseRemaining = ` (${mins} menit lagi)`;
+      }
+
+      // Balance
+      let balance = null;
+      try { balance = await getUsdcBalance(); } catch {}
+
+      const pnlEmoji = totalPnl >= 0 ? '📈' : '📉';
+      const sess = getSessionInfo();
+
+      await sendMessage(
+        `📊 <b>BTC 5M PREDICTOR</b>\n` +
+        `━━━━━━━━━━━━━━━━━\n` +
+        `💰 Balance   : <b>$${balance !== null ? balance.toFixed(2) : 'N/A'}</b>\n` +
+        `${pnlEmoji} Total PnL  : <b>${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}</b>\n` +
+        `🏆 Win Rate  : ${winRate}% (${wins}W/${losses}L)\n\n` +
+        `📍 <b>Status</b>\n` +
+        `├ Mode    : ${betMode.toUpperCase()}\n` +
+        `├ Step    : ${s.step}/${CFG.maxSteps}\n` +
+        `├ Session : ${sess.label}\n` +
+        `├ Streak  : ${consecutiveLosses} losses\n` +
+        `└ Daily   : ${dailyTradeCount}/80 trades\n\n` +
+        `📋 <b>Last 5 Trades</b>\n` +
+        tradesLine + '\n' +
+        `⚡ Circuit Breaker: ${cbStatus}${pauseRemaining}\n` +
+        `💰 Daily PnL: ${dailyPnl >= 0 ? '+' : ''}$${dailyPnl.toFixed(2)}\n` +
+        `━━━━━━━━━━━━━━━━━\n` +
+        `🌐 <a href="http://38.49.217.48:3000/?key=polymarket">Buka Web Dashboard</a>`,
+      );
+
+    } else if (cmd === '/help') {
+      await sendMessage(
+        `📖 <b>Daftar Command Bot</b>\n\n` +
+        `<b>📊 Status & Info</b>\n` +
+        `├ /status — Cek status bot lengkap\n` +
+        `├ /pnl — Cek profit/loss\n` +
+        `└ /asset — Cek asset aktif\n\n` +
+        `<b>🎮 Kontrol Bot</b>\n` +
+        `├ /start — Resume bot setelah stop\n` +
+        `├ /stop — Hentikan bot sementara\n` +
+        `└ /reset — Reset semua state &amp; PnL\n\n` +
+        `<b>🎯 Pilih Arah Bet</b>\n` +
+        `├ /yes — Paksa bet YES terus\n` +
+        `├ /no — Paksa bet NO terus\n` +
+        `└ /auto — Analisa otomatis (default)\n\n` +
+        `<b>💰 Mode Bet</b>\n` +
+        `├ /martingale — Double on loss\n` +
+        `├ /flat — Flat bet tanpa double\n` +
+        `├ /kelly — Dynamic sizing\n` +
+        `└ /bet1 /bet2 /bet3 /bet4 /bet5 — Atur bet size (flat mode only)\n\n` +
+        `<b>📈 Pilih Market BTC</b>\n` +
+        `├ /btc — Bitcoin 5m\n` +
+        `├ /btc15 — Bitcoin 15m\n` +
+        `├ /sol — Solana 5m\n` +
+        `├ /eth — Ethereum 5m\n` +
+        `├ /xrp — XRP 5m\n` +
+        `└ /doge — Dogecoin 5m\n\n` +
+        `<b>🌍 Multi-Market Manual</b>\n` +
+        `├ /mode btc — Mode BTC otomatis\n` +
+        `├ /mode sports — Mode sports manual\n` +
+        `├ /mode politics — Mode politik manual\n` +
+        `├ /search &lt;keyword&gt; — Cari market\n` +
+        `├ /pick &lt;nomor&gt; — Pilih market\n` +
+        `├ /analyze — Analisa LLM\n` +
+        `└ /bet yes|no — Eksekusi bet\n\n` +
+        `<b>🔧 Tools</b>\n` +
+        `├ /redeem — Claim manual\n` +
+        `├ /dashboard — Ringkasan statistik + link dashboard\n` +
+        `└ /help — Tampilkan pesan ini\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `💡 Tip: /search NBA → /pick 1 → /analyze → /bet yes`
+      );
+
+    // ── Multi-market manual mode commands ─────────────────────
+
+    } else if (cmd === '/mode btc') {
+      tradingMode = 'btc';
+      await sendMessage('✅ Mode: BTC 5m — bot trading otomatis seperti biasa');
+
+    } else if (cmd === '/mode sports') {
+      tradingMode = 'sports';
+      await sendMessage(
+        '⚽ <b>Mode: Sports</b>\n' +
+        'Bot BTC tetap jalan di background.\n\n' +
+        'Cara pakai:\n' +
+        '🔍 /search <keyword> — cari market\n' +
+        '📌 /pick <nomor> — pilih market\n' +
+        '🤖 /analyze — analisa LLM\n' +
+        '💰 /bet yes atau /bet no — eksekusi bet'
+      );
+
+    } else if (cmd === '/mode politics') {
+      tradingMode = 'politics';
+      await sendMessage(
+        '🗳️ <b>Mode: Politik</b>\n' +
+        'Bot BTC tetap jalan di background.\n\n' +
+        'Cara pakai:\n' +
+        '🔍 /search <keyword> — cari market\n' +
+        '📌 /pick <nomor> — pilih market\n' +
+        '🤖 /analyze — analisa LLM\n' +
+        '💰 /bet yes atau /bet no — eksekusi bet'
+      );
+
+    } else if (cmd === '/search' || cmd.startsWith('/search ')) {
+      const keyword = cmd.replace('/search', '').trim();
+      if (!keyword) {
+        await sendMessage('❌ Contoh: /search NBA Lakers');
+      } else {
+        await sendMessage(`🔍 Mencari market: <b>${keyword}</b>...`);
+        try {
+          const url = `https://gamma-api.polymarket.com/events?title=${encodeURIComponent(keyword)}&active=true&limit=5`;
+          const res = await fetch(url);
+          const data = await res.json();
+          const events = Array.isArray(data) ? data : [];
+          if (events.length === 0) {
+            await sendMessage('❌ Tidak ada market ditemukan. Coba keyword lain.');
+          } else {
+            // Store events; /pick will extract the first market from the chosen event
+            searchResults = events;
+            let msg = `🔍 <b>Hasil pencarian "${keyword}":</b>\n\n`;
+            events.forEach((ev, i) => {
+              const m = ev.markets?.[0];
+              if (!m) {
+                msg += `${i+1}. ${(ev.title ?? ev.slug ?? 'Unknown').slice(0, 80)}\n   (no market data)\n\n`;
+                return;
+              }
+              const prices = JSON.parse(m.outcomePrices ?? '["?","?"]');
+              const vol = m.volume24hr ? `$${parseFloat(m.volume24hr).toFixed(0)}` : 'N/A';
+              msg += `${i+1}. ${(ev.title ?? m.question ?? '').slice(0, 80)}\n`;
+              msg += `   YES: $${prices[0]} | NO: $${prices[1]} | Vol: ${vol}\n\n`;
+            });
+            msg += '📌 Ketik /pick <nomor> untuk pilih market';
+            await sendMessage(msg);
+          }
+        } catch (err) {
+          await sendMessage(`❌ Error search: ${err.message}`);
+        }
+      }
+
+    } else if (cmd === '/pick' || cmd.startsWith('/pick ')) {
+      const num = parseInt(cmd.replace('/pick', '').trim());
+      if (!searchResults.length) {
+        await sendMessage('❌ Lakukan /search dulu ya!');
+      } else if (isNaN(num) || num < 1 || num > searchResults.length) {
+        await sendMessage(`❌ Pilih nomor 1-${searchResults.length}`);
+      } else {
+        const ev = searchResults[num - 1];
+        // Events API: extract first market from the event
+        const m = ev.markets?.[0] ?? ev;
+        selectedMarket = {
+          question:      m.question     ?? ev.title ?? ev.slug ?? 'Unknown',
+          outcomePrices: m.outcomePrices ?? '["0.5","0.5"]',
+          volume:        m.volume        ?? ev.volume        ?? 0,
+          volume24hr:    m.volume24hr    ?? ev.volume24hr    ?? 0,
+          conditionId:   m.conditionId   ?? ev.conditionId,
+          clobTokenIds:  m.clobTokenIds  ?? '[]',
+          endDate:       m.endDate       ?? ev.endDate,
+          orderMinSize:  m.orderMinSize  ?? 5,
+        };
+        const prices = JSON.parse(selectedMarket.outcomePrices);
+        const endDate = selectedMarket.endDate
+          ? new Date(selectedMarket.endDate).toLocaleDateString('id-ID', {timeZone:'Asia/Jakarta'})
+          : 'N/A';
+        await sendMessage(
+          `✅ <b>Market dipilih:</b>\n\n` +
+          `📋 ${selectedMarket.question}\n\n` +
+          `💰 YES: $${prices[0]} | NO: $${prices[1]}\n` +
+          `📊 Volume: $${parseFloat(selectedMarket.volume ?? 0).toFixed(0)}\n` +
+          `📅 End: ${endDate}\n\n` +
+          `Ketik /analyze untuk analisa LLM\n` +
+          `atau langsung /bet yes / /bet no`
+        );
+      }
+
+    } else if (cmd === '/analyze') {
+      if (!selectedMarket) {
+        await sendMessage('❌ Pilih market dulu dengan /search dan /pick');
+      } else {
+        await sendMessage('🤖 Menganalisa market dengan LLM...');
+        try {
+          const prices = JSON.parse(selectedMarket.outcomePrices ?? '["0.5","0.5"]');
+          const yesProb = (parseFloat(prices[0]) * 100).toFixed(1);
+          const noProb = (parseFloat(prices[1]) * 100).toFixed(1);
+          const prompt =
+            `You are a prediction market analyst.\n` +
+            `Market: ${selectedMarket.question}\n` +
+            `YES price: $${prices[0]} (implied probability: ${yesProb}%)\n` +
+            `NO price: $${prices[1]} (implied probability: ${noProb}%)\n` +
+            `Volume: $${parseFloat(selectedMarket.volume ?? 0).toFixed(0)}\n` +
+            `End date: ${selectedMarket.endDate}\n\n` +
+            `Analyze this prediction market carefully.\n` +
+            `Reply in this exact format:\n` +
+            `SIDE: YES or NO\n` +
+            `CONFIDENCE: X% (0-100)\n` +
+            `REASON: (max 2 sentences explaining your reasoning)`;
+
+          const apiKey = process.env.OPENROUTER_API_KEY;
+          const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: LLM_MODELS[llmModelIndex % LLM_MODELS.length],
+              messages: [{ role: 'user', content: prompt }],
+              max_tokens: 150,
+            }),
+          });
+          const data = await res.json();
+          const text = (data?.choices?.[0]?.message?.content ?? '').trim();
+          llmRecommendation = text;
+
+          const sideMatch = text.match(/SIDE:\s*(YES|NO)/i);
+          const confMatch = text.match(/CONFIDENCE:\s*(\d+)/i);
+          const reasonMatch = text.match(/REASON:\s*(.+)/is);
+
+          const side = sideMatch ? sideMatch[1].toUpperCase() : '?';
+          const conf = confMatch ? confMatch[1] : '?';
+          const reason = reasonMatch ? reasonMatch[1].trim().slice(0, 200) : text;
+
+          await sendMessage(
+            `🤖 <b>Analisa LLM:</b>\n\n` +
+            `📋 ${selectedMarket.question.slice(0, 80)}\n\n` +
+            `🎯 Rekomendasi: <b>${side}</b>\n` +
+            `💪 Confidence: <b>${conf}%</b>\n` +
+            `💬 Alasan: ${reason}\n\n` +
+            `Ketik /bet yes atau /bet no untuk eksekusi`
+          );
+        } catch (err) {
+          await sendMessage(`❌ Analisa gagal: ${err.message}`);
+        }
+      }
+
+    } else if (cmd === '/bet yes' || cmd === '/bet no') {
+      if (!selectedMarket) {
+        await sendMessage('❌ Pilih market dulu dengan /search dan /pick');
+      } else {
+        const betSide = cmd === '/bet yes' ? 'YES' : 'NO';
+        const prices = JSON.parse(selectedMarket.outcomePrices ?? '["0.5","0.5"]');
+        const price = betSide === 'YES' ? parseFloat(prices[0]) : parseFloat(prices[1]);
+        const orderMinSize = selectedMarket.orderMinSize ?? 5;
+        const minBet = Math.ceil(orderMinSize * price * 100) / 100;
+        const betSize = Math.max(CFG.baseSize, minBet);
+
+        await sendMessage(
+          `⏳ Placing bet ${betSide} on:\n${selectedMarket.question.slice(0,60)}\nSize: $${betSize.toFixed(2)}`
+        );
+
+        try {
+          const clobTokenIds = JSON.parse(selectedMarket.clobTokenIds ?? '[]');
+          const marketObj = {
+            question: selectedMarket.question,
+            conditionId: selectedMarket.conditionId,
+            yesTokenId: clobTokenIds[0],
+            noTokenId: clobTokenIds[1],
+            endTime: selectedMarket.endDate,
+            orderMinSize: orderMinSize,
+          };
+
+          const client = global._martingaleClient;
+          if (!client) throw new Error('Client not initialized');
+
+          const result = await placeBuy(client, marketObj, betSize, betSide);
+          if (result && !result.skipped) {
+            const { fillPrice, shares } = result;
+            if (marketObj.conditionId) {
+              const tokenId = betSide === 'YES' ? marketObj.yesTokenId : marketObj.noTokenId;
+              addPosition({
+                conditionId: marketObj.conditionId,
+                tokenId,
+                market: marketObj.question,
+                shares,
+                avgBuyPrice: fillPrice,
+                totalCost: betSize,
+                outcome: betSide,
+              });
+            }
+            await sendMessage(
+              `✅ <b>BET PLACED!</b>\n\n` +
+              `📋 ${selectedMarket.question.slice(0, 60)}\n` +
+              `🎯 Side: ${betSide}\n` +
+              `💰 Size: $${betSize.toFixed(2)}\n` +
+              `📈 Price: $${fillPrice.toFixed(3)}\n` +
+              `📦 Shares: ${shares}\n\n` +
+              `✅ Claim akan otomatis setelah market resolve`
+            );
+          } else {
+            await sendMessage('❌ Bet gagal — market mungkin sudah tutup atau insufficient balance');
+          }
+        } catch (err) {
+          await sendMessage(`❌ Bet error: ${err.message}`);
+        }
+      }
     }
   });
 

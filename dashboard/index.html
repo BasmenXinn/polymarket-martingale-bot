@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BTC 5M PREDICTOR</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0a0a0f; --bg2: #0d0d15; --bg3: #111120;
+  --border: #1a1a2e; --green: #00ff88; --red: #ff4444;
+  --yellow: #ffaa00; --grey: #4a4a6a; --white: #e0e0f0;
+  --font: 'JetBrains Mono', 'Courier New', monospace;
+}
+body { background: var(--bg); color: var(--white); font-family: var(--font); font-size: 12px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+.green { color: var(--green); }
+.red   { color: var(--red); }
+.yellow{ color: var(--yellow); }
+.grey  { color: var(--grey); }
+.center{ text-align: center; }
+.small { font-size: 10px; }
+
+/* ── Login overlay ─────────────────────────────────────────── */
+#login-overlay {
+  position: fixed; inset: 0; background: var(--bg);
+  display: flex; align-items: center; justify-content: center; z-index: 999;
+}
+#login-box {
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 8px; padding: 32px 40px;
+  display: flex; flex-direction: column; gap: 14px; min-width: 300px;
+}
+#login-box h2 { color: var(--green); font-size: 14px; letter-spacing: 2px; }
+#login-box input {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 4px; color: var(--white); font-family: var(--font);
+  font-size: 12px; padding: 8px 12px; outline: none;
+}
+#login-box input:focus { border-color: var(--green); }
+#login-btn {
+  background: var(--green); border: none; border-radius: 4px;
+  color: #000; cursor: pointer; font-family: var(--font);
+  font-size: 12px; font-weight: bold; padding: 9px;
+}
+#login-err { color: var(--red); font-size: 11px; min-height: 16px; }
+
+/* ── Header ────────────────────────────────────────────────── */
+.header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--bg2);
+  flex-shrink: 0;
+}
+.header-left  { display: flex; align-items: center; gap: 10px; }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.app-title { font-size: 13px; font-weight: bold; letter-spacing: 2px; }
+.badge-live {
+  background: var(--green); color: #000; padding: 2px 8px;
+  border-radius: 12px; font-size: 10px; font-weight: bold;
+  animation: blink 2s infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.6} }
+.hpnl { font-weight: bold; }
+.hrecord { color: var(--grey); font-size: 11px; }
+.hbalance { font-size: 18px; font-weight: bold; color: var(--green); }
+.btn-stop {
+  background: rgba(255,68,68,0.2); border: 1px solid var(--red);
+  color: var(--red); padding: 5px 14px; border-radius: 6px;
+  cursor: pointer; font-family: var(--font); font-size: 11px; font-weight: bold;
+}
+.btn-stop:hover { background: rgba(255,68,68,0.35); }
+
+/* ── Latency bar ───────────────────────────────────────────── */
+.latency-bar {
+  display: flex; align-items: center; gap: 8px; padding: 5px 16px;
+  border-bottom: 1px solid var(--border); background: var(--bg2); flex-shrink: 0;
+}
+.pill {
+  padding: 2px 8px; border: 1px solid var(--border);
+  border-radius: 12px; font-size: 10px; background: var(--bg3);
+  color: var(--grey);
+}
+.pill.green  { border-color: var(--green); color: var(--green); }
+.pill.yellow { border-color: var(--yellow); color: var(--yellow); }
+.pill.red    { border-color: var(--red); color: var(--red); }
+.market-info { margin-left: auto; display: flex; gap: 16px; align-items: center; }
+.timer { color: var(--yellow); font-weight: bold; }
+
+/* ── Main 3-col grid ───────────────────────────────────────── */
+.main-grid {
+  display: grid; grid-template-columns: 240px 1fr 200px;
+  gap: 8px; padding: 8px; flex: 1; min-height: 0; overflow: hidden;
+}
+.col-left, .col-mid, .col-right {
+  display: flex; flex-direction: column; gap: 8px; overflow: hidden; min-height: 0;
+}
+.box {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg2); padding: 10px; flex-shrink: 0;
+}
+.box-header {
+  font-size: 10px; letter-spacing: 1px; color: var(--grey);
+  margin-bottom: 8px; text-transform: uppercase;
+  display: flex; justify-content: space-between; align-items: center;
+}
+
+/* ── Prediction box ────────────────────────────────────────── */
+.prediction {
+  font-size: 52px; font-weight: bold; text-align: center;
+  padding: 6px 0; line-height: 1; letter-spacing: 4px;
+}
+.prediction.green { color: var(--green); text-shadow: 0 0 20px rgba(0,255,136,0.4); }
+.prediction.red   { color: var(--red);   text-shadow: 0 0 20px rgba(255,68,68,0.4); }
+.prediction.grey  { color: var(--grey); }
+.conf-row {
+  display: flex; justify-content: space-between;
+  margin-bottom: 4px; font-size: 10px; color: var(--grey);
+}
+.conf-bar { height: 4px; background: var(--bg3); border-radius: 2px; margin-bottom: 8px; }
+.conf-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+.badge-ensemble {
+  display: inline-block;
+  background: rgba(0,255,136,0.1); border: 1px solid var(--green);
+  color: var(--green); padding: 2px 8px; border-radius: 12px; font-size: 10px;
+}
+
+/* ── Reasoning list ────────────────────────────────────────── */
+.reason-list { font-size: 11px; line-height: 2; }
+.last-bet-info { font-size: 10px; line-height: 1.9; color: var(--grey); }
+
+/* ── Order book / price header ─────────────────────────────── */
+.price-header {
+  display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px;
+}
+.btc-price { font-size: 15px; font-weight: bold; }
+.price-change { font-size: 12px; font-weight: bold; }
+.stk-row {
+  display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 8px;
+}
+.ob-grid { display: flex; flex-direction: column; gap: 2px; }
+.ob-row  { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.ob-bid, .ob-ask {
+  padding: 2px 4px; position: relative;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.ob-bid::before {
+  content: ''; position: absolute; right: 0; top: 0; bottom: 0;
+  width: var(--w, 0%); background: rgba(0,255,136,0.1);
+}
+.ob-ask::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: var(--w, 0%); background: rgba(255,68,68,0.1);
+}
+.spread-bar {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-top: 8px; padding: 4px; border: 1px solid var(--border); border-radius: 4px;
+}
+.spread-box {
+  background: rgba(255,68,68,0.15); padding: 1px 6px;
+  border-radius: 3px; font-size: 10px; color: var(--yellow);
+}
+
+/* ── Features box ──────────────────────────────────────────── */
+.col-right .box.features { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.feat-list { flex: 1; overflow-y: auto; margin-bottom: 8px; }
+.feat-row {
+  display: flex; justify-content: space-between; padding: 3px 0;
+  border-bottom: 1px solid var(--border); font-size: 11px;
+}
+.feat-timer { color: var(--grey); font-size: 10px; }
+.btn-feature {
+  width: 100%; padding: 5px; background: var(--bg3);
+  border: 1px solid var(--border); color: var(--white);
+  border-radius: 4px; font-family: var(--font); font-size: 11px;
+  cursor: not-allowed; margin-bottom: 4px; opacity: 0.4;
+}
+
+/* ── Middle column ─────────────────────────────────────────── */
+.col-mid .box { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+
+/* ── Trades section ────────────────────────────────────────── */
+.trades-section {
+  padding: 0 8px 8px; flex-shrink: 0;
+  max-height: 32vh; overflow-y: auto; min-height: 0;
+}
+.trades-header { font-size: 11px; font-weight: bold; margin-bottom: 6px; letter-spacing: 1px; color: var(--grey); text-transform: uppercase; }
+.trades-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.trades-table th {
+  color: var(--grey); text-transform: uppercase; font-size: 9px;
+  padding: 4px 8px; border-bottom: 1px solid var(--border);
+  text-align: left; background: var(--bg2); position: sticky; top: 0;
+}
+.trades-table td { padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.row-win  { border-left: 2px solid var(--green); }
+.row-loss { border-left: 2px solid var(--red); }
+.row-win  td { background: rgba(0,255,136,0.03); }
+.row-loss td { background: rgba(255,68,68,0.03); }
+
+/* ── Footer ────────────────────────────────────────────────── */
+.footer {
+  display: flex; justify-content: space-between; padding: 5px 16px;
+  border-top: 1px solid var(--border); background: var(--bg2);
+  font-size: 10px; color: var(--grey); flex-shrink: 0;
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ── Mobile ────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  body { overflow-y: auto; overflow-x: hidden; height: auto; }
+  .main-grid { grid-template-columns: 1fr; overflow-y: visible; }
+  .col-mid .box, .col-right .box.features { flex: none; }
+  .trades-section { max-height: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- Login overlay -->
+<div id="login-overlay">
+  <div id="login-box">
+    <h2>⬡ POLYMARKET DASHBOARD</h2>
+    <input id="key-input" type="password" placeholder="Enter access key..." autocomplete="off">
+    <button id="login-btn">ENTER</button>
+    <div id="login-err"></div>
+  </div>
+</div>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-left">
+    <span class="app-title">BTC 5M PREDICTOR</span>
+    <span class="badge-live">● LIVE</span>
+    <span class="hpnl" id="hPnl">+0.00 USDC</span>
+    <span class="hrecord" id="hRecord">0W / 0L (0.0%)</span>
+  </div>
+  <div class="header-right">
+    <span class="hbalance" id="hBalance">$0.00</span>
+    <button class="btn-stop" onclick="stopBot()">■ STOP</button>
+  </div>
+</div>
+
+<!-- LATENCY BAR -->
+<div class="latency-bar">
+  <span class="pill" id="lBinance">● Binance --ms</span>
+  <span class="pill" id="lClob">● CLOB --ms</span>
+  <span class="pill" id="lML">● ML --</span>
+  <div class="market-info">
+    <span id="marketSlug" class="grey small">--</span>
+    <span id="marketTimer" class="timer">--s</span>
+  </div>
+</div>
+
+<!-- MAIN 3 COLUMNS -->
+<div class="main-grid">
+
+  <!-- LEFT: PREDICTION -->
+  <div class="col-left">
+    <div class="box">
+      <div class="box-header">NEXT PREDICTION</div>
+      <div class="prediction grey" id="predDir">--</div>
+      <div class="conf-row">
+        <span>Confidence</span>
+        <span id="confPct">0%</span>
+      </div>
+      <div class="conf-bar">
+        <div class="conf-fill" id="confFill" style="width:0%"></div>
+      </div>
+      <span class="badge-ensemble">ENSEMBLE</span>
+    </div>
+
+    <div class="box">
+      <div class="box-header">REASONING</div>
+      <div id="reasoningList" class="reason-list"><span class="grey">Waiting for signal...</span></div>
+    </div>
+
+    <div class="box">
+      <div class="box-header">LAST BET</div>
+      <div id="lastBetInfo" class="last-bet-info"><span class="grey">No bets yet</span></div>
+    </div>
+  </div>
+
+  <!-- MIDDLE: ORDER BOOK -->
+  <div class="col-mid">
+    <div class="box">
+      <div class="price-header">
+        <span id="btcPrice" class="btc-price green">BTC $--</span>
+        <span id="btcChange" class="price-change grey">--%</span>
+      </div>
+      <div class="stk-row">
+        <span id="stkUp" class="green small">UP fv=-- gap=--</span>
+        <span id="stkDn" class="red small">DN fv=--</span>
+      </div>
+      <div class="ob-grid" id="orderbookGrid">
+        <div class="grey center small" style="padding:20px 0">Loading orderbook...</div>
+      </div>
+      <div class="spread-bar">
+        <span id="spreadLeft" class="red small">--</span>
+        <span id="spreadMid" class="spread-box">--%</span>
+        <span id="spreadRight" class="green small">--</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: FEATURES -->
+  <div class="col-right">
+    <div class="box features">
+      <div class="box-header">
+        FEATURES
+        <span id="featTimer" class="feat-timer">--s pos=0</span>
+      </div>
+      <div id="featValues" class="feat-list">
+        <div class="grey small center" style="padding:8px 0">Waiting...</div>
+      </div>
+      <button class="btn-feature" disabled>Train ML</button>
+      <button class="btn-feature" disabled>Backtest</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- RECENT TRADES TABLE -->
+<div class="trades-section">
+  <div class="trades-header">Recent Trades</div>
+  <table class="trades-table">
+    <thead>
+      <tr>
+        <th>Time (WIB)</th>
+        <th>Dir</th>
+        <th>Price</th>
+        <th>Size</th>
+        <th>Conf / Src</th>
+        <th>TTX</th>
+        <th>PnL</th>
+        <th>Claim</th>
+      </tr>
+    </thead>
+    <tbody id="tradesBody">
+      <tr><td colspan="8" class="grey center" style="padding:12px">Loading trades...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- FOOTER -->
+<div class="footer">
+  <div id="cbStatus"><span class="green">CIRCUIT BREAKER: OK ●</span></div>
+  <div id="lastUpdated">Updated --</div>
+</div>
+
+<script>
+// ── Key management ──────────────────────────────────────────
+let API_KEY = localStorage.getItem('dashboard_key') || '';
+
+function setKey(k) {
+  API_KEY = k;
+  localStorage.setItem('dashboard_key', k);
+}
+
+async function tryLogin() {
+  const k = document.getElementById('key-input').value.trim();
+  if (!k) return;
+  try {
+    const r = await fetch(`/api/stats?key=${encodeURIComponent(k)}`);
+    if (r.status === 401) {
+      document.getElementById('login-err').textContent = 'Invalid key.';
+      return;
+    }
+    setKey(k);
+    document.getElementById('login-overlay').style.display = 'none';
+    startRefresh();
+  } catch (e) {
+    document.getElementById('login-err').textContent = 'Connection error: ' + e.message;
+  }
+}
+
+document.getElementById('login-btn').addEventListener('click', tryLogin);
+document.getElementById('key-input').addEventListener('keydown', e => { if (e.key === 'Enter') tryLogin(); });
+
+async function stopBot() {
+  if (!confirm('Stop the martingale bot?')) return;
+  try {
+    const r = await fetch(`/api/stop?key=${encodeURIComponent(API_KEY)}`, { method: 'POST' });
+    const d = await r.json();
+    alert(d.message ?? d.error ?? 'Done');
+  } catch (e) { alert('Error: ' + e.message); }
+}
+
+// ── State ───────────────────────────────────────────────────
+let stats = {}, binance = {}, lastUpdate = 0;
+
+// ── Fetch ───────────────────────────────────────────────────
+async function fetchAll() {
+  const t0 = Date.now();
+  try {
+    const [s, b] = await Promise.all([
+      fetch(`/api/stats?key=${encodeURIComponent(API_KEY)}`).then(r => {
+        if (r.status === 401) throw Object.assign(new Error('Unauthorized'), { status: 401 });
+        return r.json();
+      }),
+      fetch(`/api/binance?key=${encodeURIComponent(API_KEY)}`).then(r => r.json()),
+    ]);
+    const latency = Date.now() - t0;
+    stats = s; binance = b;
+    lastUpdate = Date.now();
+    render(latency);
+  } catch (err) {
+    if (err.status === 401) {
+      clearInterval(refreshTimer);
+      document.getElementById('login-overlay').style.display = 'flex';
+    }
+    // network blip — keep last render
+  }
+}
+
+// ── Render ──────────────────────────────────────────────────
+function render(latency) {
+  // ── Header ──────────────────────────────────────────────
+  const pnl = stats.totalPnl ?? 0;
+  const pnlEl = document.getElementById('hPnl');
+  pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' USDC';
+  pnlEl.className = 'hpnl ' + (pnl >= 0 ? 'green' : 'red');
+
+  document.getElementById('hRecord').textContent =
+    `${stats.wins ?? 0}W / ${stats.losses ?? 0}L (${stats.winRate ?? '0.0'}%)`;
+
+  const bal = stats.balance ?? 0;
+  document.getElementById('hBalance').textContent = '$' + parseFloat(bal).toFixed(2);
+
+  // ── Latency pills ────────────────────────────────────────
+  const binLat = binance.binanceLatency ?? latency;
+  const lBin = document.getElementById('lBinance');
+  lBin.textContent = `● Binance ${binLat}ms`;
+  lBin.className = 'pill ' + (binLat < 300 ? 'green' : binLat < 800 ? 'yellow' : 'red');
+
+  const clobLat = stats.clobLatency;
+  const lClob = document.getElementById('lClob');
+  if (clobLat !== null && clobLat !== undefined) {
+    lClob.textContent = `● CLOB ${clobLat}ms`;
+    lClob.className = 'pill ' + (clobLat < 5000 ? 'green' : 'yellow');
+  } else {
+    lClob.textContent = '● CLOB --ms';
+    lClob.className = 'pill grey';
+  }
+
+  const lML = document.getElementById('lML');
+  lML.textContent = stats.lastSignal ? '● ML Ready' : '● ML Waiting';
+  lML.className = 'pill ' + (stats.lastSignal ? 'green' : 'yellow');
+
+  // ── Market slug / timer ──────────────────────────────────
+  const cm = stats.currentMarket ?? {};
+  const lb = stats.lastBet ?? {};
+  const slug = cm.slug ?? lb.market ?? null;
+  if (slug) {
+    document.getElementById('marketSlug').textContent = slug.slice(0, 45);
+  }
+  if (lb.endTime) {
+    const left = Math.max(0, new Date(lb.endTime).getTime() - Date.now());
+    document.getElementById('marketTimer').textContent = Math.round(left / 1000) + 's';
+  }
+
+  // ── Prediction ───────────────────────────────────────────
+  const sig  = stats.lastSignal ?? {};
+  const side = sig.side;
+  const predEl = document.getElementById('predDir');
+  if (side === 'YES') {
+    predEl.textContent = 'UP';
+    predEl.className = 'prediction green';
+  } else if (side === 'NO') {
+    predEl.textContent = 'DOWN';
+    predEl.className = 'prediction red';
+  } else {
+    predEl.textContent = '--';
+    predEl.className = 'prediction grey';
+  }
+
+  const conf = sig.confidence ?? 0;
+  document.getElementById('confPct').textContent = (conf * 100).toFixed(0) + '%';
+  const fill = document.getElementById('confFill');
+  fill.style.width = (conf * 100) + '%';
+  fill.style.background = conf > 0.65 ? 'var(--green)' : conf > 0.33 ? 'var(--yellow)' : 'var(--red)';
+
+  // ── Reasoning ────────────────────────────────────────────
+  const reasons = [
+    { key: 'OB',   val: sig.orderbook },
+    { key: 'RSI',  val: sig.rsi },
+    { key: 'BB',   val: sig.bb },
+    { key: 'Wick', val: sig.wick },
+    { key: 'LLM',  val: sig.llm },
+    { key: 'PA',   val: sig.priceAction },
+    { key: 'Mom',  val: sig.momentum },
+  ];
+  document.getElementById('reasoningList').innerHTML = reasons.map(r => {
+    const v = r.val;
+    const prefix = v === 'YES' ? '+' : v === 'NO' ? '-' : '~';
+    const cls = v === 'YES' ? 'green' : v === 'NO' ? 'red' : 'grey';
+    return `<div class="${cls}">${prefix} [${r.key}] ${v ?? 'null'}</div>`;
+  }).join('');
+
+  // ── Last bet ─────────────────────────────────────────────
+  if (lb.market) {
+    const sideCls = lb.side === 'YES' ? 'green' : 'red';
+    document.getElementById('lastBetInfo').innerHTML =
+      `<div class="grey">${lb.market.slice(0, 42)}...</div>` +
+      `<div>Side: <span class="${sideCls}">${lb.side}</span> | Size: $${(lb.size ?? 0).toFixed(2)}</div>` +
+      `<div class="grey">Price: $${(lb.price ?? 0).toFixed(3)}</div>`;
+  }
+
+  // ── BTC Price ────────────────────────────────────────────
+  if (binance.price) {
+    document.getElementById('btcPrice').textContent =
+      'BTC $' + binance.price.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+
+    const chg = binance.change24h ?? 0;
+    const chgEl = document.getElementById('btcChange');
+    chgEl.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(3) + '%';
+    chgEl.className = 'price-change ' + (chg >= 0 ? 'green' : 'red');
+
+    // fv / gap lines
+    const fvUp = sig.confidence ?? 0.5;
+    const fvDn = 1 - fvUp;
+    document.getElementById('stkUp').textContent =
+      `UP fv=${fvUp.toFixed(3)} gap=${((fvUp - 0.5) * 100).toFixed(1)}c`;
+    document.getElementById('stkDn').textContent =
+      `DN fv=${fvDn.toFixed(3)}`;
+
+    // ── Order Book Grid ──────────────────────────────────
+    const bids = binance.bids ?? [];
+    const asks = binance.asks ?? [];
+    const maxQ = Math.max(
+      ...bids.map(b => b[1]),
+      ...asks.map(a => a[1]),
+      1,
+    );
+    let obHtml = '';
+    for (let i = 0; i < 6; i++) {
+      const bid = bids[i] ?? [0, 0];
+      const ask = asks[i] ?? [0, 0];
+      const bidPct = ((bid[1] / maxQ) * 100).toFixed(0);
+      const askPct = ((ask[1] / maxQ) * 100).toFixed(0);
+      obHtml += `
+        <div class="ob-row">
+          <div class="ob-bid" style="--w:${bidPct}%">
+            <span class="green">${bid[0].toFixed(1)}</span>
+            <span class="grey small">${bid[1].toFixed(3)}</span>
+          </div>
+          <div class="ob-ask" style="--w:${askPct}%">
+            <span class="grey small">${ask[1].toFixed(3)}</span>
+            <span class="red">${ask[0].toFixed(1)}</span>
+          </div>
+        </div>`;
+    }
+    document.getElementById('orderbookGrid').innerHTML = obHtml;
+
+    // ── Spread bar ───────────────────────────────────────
+    const tb = binance.totalBid ?? 1;
+    const ta = binance.totalAsk ?? 1;
+    const bidRatio = (tb / (tb + ta) * 100).toFixed(1);
+    const askRatio = (ta / (tb + ta) * 100).toFixed(1);
+    document.getElementById('spreadRight').textContent = bidRatio + '%';
+    document.getElementById('spreadLeft').textContent  = askRatio + '%';
+    const spread = Math.abs((asks[0]?.[0] ?? 0) - (bids[0]?.[0] ?? 0));
+    document.getElementById('spreadMid').textContent =
+      (spread / binance.price * 100).toFixed(3) + '%';
+  }
+
+  // ── Feature values ───────────────────────────────────────
+  const feats = [
+    { k: 'fvUp',    v: sig.confidence ?? null },
+    { k: 'fvDown',  v: sig.confidence != null ? 1 - (sig.confidence ?? 0.5) : null },
+    { k: 'obi20',   v: binance.obi20   ?? null },
+    { k: 'depthR',  v: binance.depthR  ?? null },
+    { k: 'mom30s',  v: binance.mom30s  ?? null },
+    { k: 'vol',     v: binance.vol     ?? null },
+    { k: 'gapUp',   v: sig.confidence != null ? (sig.confidence ?? 0.5) - 0.5 : null },
+    { k: 'gapDown', v: sig.confidence != null ? (1 - (sig.confidence ?? 0.5)) - 0.5 : null },
+    { k: 'streak',  v: stats.consecutiveLosses ?? null },
+    { k: 'step',    v: stats.step ?? null },
+  ];
+  document.getElementById('featValues').innerHTML = feats.map(f => {
+    if (f.v == null) {
+      return `<div class="feat-row"><span class="grey">${f.k}</span><span class="grey">--</span></div>`;
+    }
+    const cls = f.v >= 0 ? 'green' : 'red';
+    return `<div class="feat-row"><span class="grey">${f.k}</span><span class="${cls}">${f.v.toFixed(4)}</span></div>`;
+  }).join('');
+
+  // ── Feature timer ────────────────────────────────────────
+  document.getElementById('featTimer').textContent =
+    (lb.endTime
+      ? Math.max(0, Math.round((new Date(lb.endTime).getTime() - Date.now()) / 1000)) + 's'
+      : '--s') +
+    ' pos=' + (stats.openPositions ?? 0);
+
+  // ── Recent trades table ──────────────────────────────────
+  const trades = stats.recentTrades ?? [];
+  if (trades.length === 0) {
+    document.getElementById('tradesBody').innerHTML =
+      '<tr><td colspan="8" class="grey center" style="padding:12px">No trades yet</td></tr>';
+  } else {
+    document.getElementById('tradesBody').innerHTML = trades.slice(0, 20).map(t => {
+      const isWin  = t.outcome === 'win';
+      const dirCls = t.side === 'YES' ? 'green' : 'red';
+      const dirTxt = t.side === 'YES' ? 'Up' : 'Down';
+      const pnlCls = isWin ? 'green' : 'red';
+      const pnlAbs = Math.abs(t.pnl ?? 0).toFixed(2);
+      const pnlTxt = isWin ? `+$${pnlAbs} win` : `-$${pnlAbs} loss`;
+      const claim  = isWin
+        ? `<span class="green">+$${(Math.abs(t.pnl ?? 0) + (t.size ?? 1)).toFixed(2)}</span>`
+        : '<span class="grey">—</span>';
+      const time = t.ts
+        ? new Date(t.ts).toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        : '--';
+      return `<tr class="${isWin ? 'row-win' : 'row-loss'}">
+        <td class="grey small">${time}</td>
+        <td><span class="${dirCls}">${dirTxt}</span></td>
+        <td class="grey">$${(t.price ?? 0.97).toFixed(3)}</td>
+        <td>$${(t.size ?? 1).toFixed(2)}</td>
+        <td class="grey">${((t.confidence ?? 0.33) * 100).toFixed(0)}% ensemble</td>
+        <td class="grey">${t.ttx ?? '--'}s</td>
+        <td class="${pnlCls}">${pnlTxt}</td>
+        <td>${claim}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // ── Circuit breaker footer ───────────────────────────────
+  const cb     = stats.circuitBreaker ?? {};
+  const paused = cb.pauseUntil && Date.now() < cb.pauseUntil;
+  const cbEl   = document.getElementById('cbStatus');
+  if (paused) {
+    const mins = Math.ceil((cb.pauseUntil - Date.now()) / 60000);
+    cbEl.innerHTML = `<span class="red">CIRCUIT BREAKER: PAUSED ${mins}min ●</span>`;
+  } else {
+    cbEl.innerHTML =
+      `<span class="green">CIRCUIT BREAKER: OK ●</span>` +
+      `<span class="grey"> Losses: ${cb.consecutiveLosses ?? 0} | ` +
+      `Daily: ${stats.dailyTradeCount ?? 0}/80 | ` +
+      `Step: ${stats.step ?? 0}/${stats.maxSteps ?? 5}</span>`;
+  }
+
+  // ── Last updated ─────────────────────────────────────────
+  const secAgo = Math.round((Date.now() - lastUpdate) / 1000);
+  document.getElementById('lastUpdated').textContent =
+    `Updated: ${new Date().toLocaleTimeString('id-ID')} (${secAgo}s ago)`;
+}
+
+// ── Refresh loop ────────────────────────────────────────────
+let refreshTimer = null;
+
+function startRefresh() {
+  fetchAll();
+  refreshTimer = setInterval(fetchAll, 3000);
+}
+
+// ── Init ─────────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  if (API_KEY) {
+    fetch(`/api/stats?key=${encodeURIComponent(API_KEY)}`)
+      .then(r => {
+        if (r.ok) {
+          document.getElementById('login-overlay').style.display = 'none';
+          startRefresh();
+        } else {
+          localStorage.removeItem('dashboard_key');
+          API_KEY = '';
+        }
+      })
+      .catch(() => {});
+  }
+});
+</script>
+</body>
+</html>
