@@ -68,6 +68,12 @@ body { background: var(--bg); color: var(--white); font-family: var(--font); fon
   cursor: pointer; font-family: var(--font); font-size: 11px; font-weight: bold;
 }
 .btn-stop:hover { background: rgba(255,68,68,0.35); }
+.btn-start {
+  background: rgba(0,255,136,0.2); border: 1px solid var(--green);
+  color: var(--green); padding: 5px 14px; border-radius: 6px;
+  cursor: pointer; font-family: var(--font); font-size: 11px; font-weight: bold;
+}
+.btn-start:hover { background: rgba(0,255,136,0.35); }
 
 /* ── Latency bar ───────────────────────────────────────────── */
 .latency-bar {
@@ -238,7 +244,8 @@ body { background: var(--bg); color: var(--white); font-family: var(--font); fon
   </div>
   <div class="header-right">
     <span class="hbalance" id="hBalance">$0.00</span>
-    <button class="btn-stop" onclick="stopBot()">■ STOP</button>
+    <button class="btn-stop" id="btnStop" onclick="stopBot()">■ STOP</button>
+    <button class="btn-start" id="btnStart" onclick="startBot()" style="display:none">▶ START</button>
   </div>
 </div>
 
@@ -382,6 +389,17 @@ async function stopBot() {
   if (!confirm('Stop the martingale bot?')) return;
   try {
     const r = await fetch(`/api/stop?key=${encodeURIComponent(API_KEY)}`, { method: 'POST' });
+    const d = await r.json();
+    alert(d.message ?? d.error ?? 'Done');
+    document.getElementById('btnStop').style.display = 'none';
+    document.getElementById('btnStart').style.display = '';
+  } catch (e) { alert('Error: ' + e.message); }
+}
+
+async function startBot() {
+  if (!confirm('Start the martingale bot?')) return;
+  try {
+    const r = await fetch(`/api/start?key=${encodeURIComponent(API_KEY)}`, { method: 'POST' });
     const d = await r.json();
     alert(d.message ?? d.error ?? 'Done');
   } catch (e) { alert('Error: ' + e.message); }

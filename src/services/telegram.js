@@ -23,37 +23,46 @@ export function sendMessage(text) {
 }
 
 // ── Convenience wrappers ──────────────────────────────────────
-export function notifyBuy({ market, betSize, price, side }) {
+export function notifyBuy({ market, betSize, price, side, mode, timeWIB, reason }) {
   return sendMessage(
-    `📥 <b>BUY ORDER PLACED</b>\n` +
-    `Market : ${escHtml(market.slice(0, 60))}\n` +
-    `Side   : ${side}\n` +
-    `Size   : $${betSize.toFixed(2)}\n` +
-    `Price  : $${price.toFixed(3)}`,
+    '📥 <b>BET PLACED</b>\n' +
+    '━━━━━━━━━━━━━━━━━\n' +
+    '📋 ' + escHtml(market.slice(0, 50)) + '\n\n' +
+    '🎯 Side    : <b>' + side + '</b>\n' +
+    '💰 Size    : $' + betSize.toFixed(2) + '\n' +
+    '📈 Price   : $' + price.toFixed(3) + '\n' +
+    (mode    ? '🤖 Mode    : ' + mode + '\n' : '') +
+    (timeWIB ? '🕐 Time    : ' + timeWIB + ' WIB\n' : '') +
+    (reason  ? '💡 Signal  : ' + escHtml(reason) + '\n' : '') +
+    '━━━━━━━━━━━━━━━━━',
   );
 }
 
-export function notifyWin({ market, pnl, step, totalPnl, balance }) {
-  const balanceLine = balance != null ? `\n💰 Balance: $${balance.toFixed(2)}` : '';
+export function notifyWin({ market, pnl, step, totalPnl, balance, txHash }) {
   return sendMessage(
-    `✅ <b>WIN</b>\n` +
-    `Market   : ${escHtml(market.slice(0, 60))}\n` +
-    `PnL      : +$${pnl.toFixed(2)}\n` +
-    `Step     : reset → 0\n` +
-    `Total PnL: $${totalPnl.toFixed(2)}` +
-    balanceLine,
+    '🏆 <b>WIN!</b>\n' +
+    '━━━━━━━━━━━━━━━━━\n' +
+    '📋 ' + escHtml(market.slice(0, 50)) + '\n\n' +
+    '💰 Profit    : <b>+$' + pnl.toFixed(2) + '</b>\n' +
+    '📊 Total PnL : $' + (totalPnl != null ? totalPnl.toFixed(2) : '—') + (totalPnl != null ? (totalPnl >= 0 ? ' 📈' : ' 📉') : '') + '\n' +
+    '🏦 Balance   : $' + (balance != null ? balance.toFixed(2) : '—') + '\n' +
+    '🎯 Next Step : 0 (reset)\n' +
+    (txHash ? '🔗 TX: ' + txHash.slice(0, 10) + '...\n' : '') +
+    '━━━━━━━━━━━━━━━━━',
   );
 }
 
-export function notifyLoss({ market, pnl, newStep, nextBet, balance }) {
-  const balanceLine = balance != null ? `\n💰 Balance: $${balance.toFixed(2)}` : '';
+export function notifyLoss({ market, pnl, newStep, nextBet, balance, totalPnl, txHash }) {
   return sendMessage(
-    `❌ <b>LOSS</b>\n` +
-    `Market  : ${escHtml(market.slice(0, 60))}\n` +
-    `PnL     : -$${Math.abs(pnl).toFixed(2)}\n` +
-    `New Step: ${newStep}\n` +
-    `Next Bet: $${nextBet.toFixed(2)}` +
-    balanceLine,
+    '❌ <b>LOSS</b>\n' +
+    '━━━━━━━━━━━━━━━━━\n' +
+    '📋 ' + escHtml(market.slice(0, 50)) + '\n\n' +
+    '💸 Loss      : <b>-$' + Math.abs(pnl).toFixed(2) + '</b>\n' +
+    '📊 Total PnL : $' + (totalPnl != null ? totalPnl.toFixed(2) : '—') + (totalPnl != null ? (totalPnl >= 0 ? ' 📈' : ' 📉') : '') + '\n' +
+    '🏦 Balance   : $' + (balance != null ? balance.toFixed(2) : '—') + '\n' +
+    '⚡ Next Step : ' + newStep + ' → Bet $' + nextBet.toFixed(2) + '\n' +
+    (txHash ? '🔗 TX: ' + txHash.slice(0, 10) + '...\n' : '') +
+    '━━━━━━━━━━━━━━━━━',
   );
 }
 
@@ -109,7 +118,43 @@ export async function startPolling(commandHandler) {
   }
 
   logger.info('[Telegram] Command polling started');
-  sendMessage('🤖 <b>Martingale Bot started</b>\nCommands: /status /pnl /stop /start /reset /yes /no /auto /btc /sol /eth /xrp /doge /asset');
+  sendMessage(
+    `🤖 <b>Martingale Bot V2 — Online!</b>\n\n` +
+    `<b>📊 Status &amp; Info</b>\n` +
+    `├ /status — Cek status bot lengkap\n` +
+    `├ /pnl — Cek profit/loss\n` +
+    `└ /asset — Cek asset aktif saat ini\n\n` +
+    `<b>🎮 Kontrol Bot</b>\n` +
+    `├ /start — Mulai bot (resume setelah /stop)\n` +
+    `├ /stop — Hentikan bot sementara\n` +
+    `└ /reset — Reset semua state &amp; PnL\n\n` +
+    `<b>🎯 Pilih Arah Bet</b>\n` +
+    `├ /yes — Paksa bet YES terus\n` +
+    `├ /no — Paksa bet NO terus\n` +
+    `└ /auto — Analisa otomatis (default)\n\n` +
+    `<b>💰 Mode Bet</b>\n` +
+    `├ /martingale — Martingale (double on loss)\n` +
+    `├ /flat — Flat $1 tanpa double\n` +
+    `└ /kelly — Kelly Criterion (dynamic sizing)\n\n` +
+    `<b>📈 Pilih Market</b>\n` +
+    `├ /btc — Bitcoin 5m\n` +
+    `├ /btc15 — Bitcoin 15m\n` +
+    `├ /sol — Solana 5m\n` +
+    `├ /eth — Ethereum 5m\n` +
+    `├ /xrp — XRP 5m\n` +
+    `└ /doge — Dogecoin 5m\n\n` +
+    `<b>🌍 Multi-Market Manual</b>\n` +
+    `├ /mode btc/sports/politics — switch trading mode\n` +
+    `├ /search <keyword> — cari market manual\n` +
+    `├ /pick <nomor> — pilih market\n` +
+    `├ /analyze — analisa LLM\n` +
+    `└ /bet yes/no — eksekusi bet manual\n\n` +
+    `<b>🔧 Manual Tools</b>\n` +
+    `├ /redeem — Trigger claim manual\n` +
+    `└ /help — Lihat semua command\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `⚡ Bot siap trading! Semoga profit! 🚀`
+  );
 
   async function poll() {
     try {

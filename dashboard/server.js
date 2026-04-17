@@ -246,6 +246,14 @@ app.post('/api/stop', auth, (_req, res) => {
   });
 });
 
+// Start bot
+app.post('/api/start', auth, (_req, res) => {
+  exec('pm2 start martingale-bot', (err) => {
+    if (err) res.json({ error: err.message });
+    else res.json({ message: 'Bot started!' });
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`[Dashboard] Listening on http://localhost:${PORT}/?key=${DASHBOARD_KEY}`);
 });

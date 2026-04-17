@@ -1439,14 +1439,21 @@ async function main() {
       updateCircuitBreakerState();
       await sendMessage('✅ State reset! Step: 0, PnL: $0.00, V2 counters cleared');
     } else if (cmd === '/stop') {
-      if (isShuttingDown) return;
+      if (isShuttingDown) {
+        await sendMessage('⚠️ Bot sudah di-pause. Ketik /start untuk lanjutkan.');
+        return;
+      }
       isShuttingDown = true;
-      await sendMessage('🛑 Stopping bot gracefully...');
       stopMMDetector();
       stopRedeemerLoop();
-      stopPolling();
-      const pmTarget = process.env.name ?? process.env.pm_id ?? 'martingale-bot';
-      exec(`pm2 stop ${pmTarget}`, () => process.exit(0));
+      await sendMessage(
+        '⏸ <b>Bot di-pause</b>\n' +
+        '━━━━━━━━━━━━━━━━━\n' +
+        '🛑 MM detector stopped\n' +
+        '🛑 Redeemer stopped\n' +
+        '💡 Ketik /start untuk lanjutkan\n' +
+        '━━━━━━━━━━━━━━━━━'
+      );
     } else if (cmd === '/redeem') {
       await sendMessage('🔍 Manually triggering checkAndRedeemPositions()...');
       try {

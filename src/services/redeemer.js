@@ -1,4 +1,5 @@
 import { exec } from 'child_process';
+import fs from 'fs';
 import { ethers } from 'ethers';
 import config from '../config/index.js';
 import { getPolygonProvider, getUsdcBalance } from './client.js';
@@ -8,20 +9,17 @@ import { loadMartingaleState, registerOutcome, printSummary } from './martingale
 import { recordSimResult } from '../utils/simStats.js';
 import logger from '../utils/logger.js';
 import { proxyFetch } from '../utils/proxy.js';
-import { sendMessage, notifyRedeem, notifyWin, notifyLoss } from './telegram.js';
+import { sendMessage, notifyWin, notifyLoss } from './telegram.js';
 
 const STOP_LOSS_THRESHOLD   = parseFloat(process.env.STOP_LOSS_THRESHOLD   ?? '5');
 const TAKE_PROFIT_THRESHOLD = parseFloat(process.env.TAKE_PROFIT_THRESHOLD ?? '20');
 
+// Track how many times each position has been retried waiting for on-chain payout
+const payoutRetryCount = new Map(); // conditionId → retry count
+
 async function checkStopLoss(balance) {
     if (balance !== null && balance < STOP_LOSS_THRESHOLD) {
-        logger.warn(`[Redeemer] STOP LOSS triggered — balance $${balance.toFixed(2)} < $${STOP_LOSS_THRESHOLD}`);
-        await sendMessage(
-            `🛑 <b>STOP LOSS TRIGGERED</b>\n` +
-            `Balance: <b>$${balance.toFixed(2)}</b>\n` +
-            `Bot stopped.`,
-        );
-        exec('pm2 stop martingale-bot');
+        logger.warn(`[Redeemer] Low balance warning: $${balance.toFixed(2)} but continuing`);
     }
 }
 
@@ -44,6 +42,59 @@ const REDEEM_CFG = {
   resetOnWin:  (process.env.MARTINGALE_RESET_ON_WIN ?? 'true') === 'true',
 };
 
+// ── Circuit breaker shared state (FIX 3) ──────────────────────
+const CB_FILE = 'data/circuit-breaker.json';
+
+function readCircuitBreakerState() {
+    try {
+        return JSON.parse(fs.readFileSync(CB_FILE, 'utf8'));
+    } catch {
+        return { consecutiveLosses: 0, pauseUntil: null };
+    }
+}
+
+function writeCircuitBreakerState(state) {
+    try {
+        fs.writeFileSync(CB_FILE, JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2));
+    } catch (err) {
+        logger.warn(`[Redeemer] Failed to write circuit-breaker.json: ${err.message}`);
+    }
+}
+
+async function updateCircuitBreakerOnOutcome(isWin, market) {
+    const cb = readCircuitBreakerState();
+    if (isWin) {
+        cb.consecutiveLosses = 0;
+        cb.pauseUntil = null;
+        writeCircuitBreakerState(cb);
+        logger.info(`[Circuit] WIN — reset consecutiveLosses=0 pauseUntil=null`);
+    } else {
+        cb.consecutiveLosses = (cb.consecutiveLosses ?? 0) + 1;
+        let pauseMs = null;
+        let pauseLabel = null;
+        if (cb.consecutiveLosses === 3)      { pauseMs = 15 * 60 * 1000;       pauseLabel = '15min'; }
+        else if (cb.consecutiveLosses === 4) { pauseMs = 60 * 60 * 1000;       pauseLabel = '1hr'; }
+        else if (cb.consecutiveLosses >= 5)  { pauseMs = 24 * 60 * 60 * 1000;  pauseLabel = '24hrs'; }
+        if (pauseMs !== null) {
+            cb.pauseUntil = Date.now() + pauseMs;
+            writeCircuitBreakerState(cb);
+            logger.warn(`[Circuit] ${cb.consecutiveLosses} consecutive losses → pause ${pauseLabel}`);
+            try {
+                await sendMessage(
+                    `⏸ <b>CIRCUIT BREAKER</b>\n` +
+                    `Consecutive losses: ${cb.consecutiveLosses}\n` +
+                    `Pausing for: ${pauseLabel}`,
+                );
+            } catch (err) {
+                logger.warn(`[Circuit] Telegram notify failed: ${err.message}`);
+            }
+        } else {
+            writeCircuitBreakerState(cb);
+            logger.info(`[Circuit] LOSS — consecutiveLosses=${cb.consecutiveLosses} (no pause yet)`);
+        }
+    }
+}
+
 // CTF ABI (minimal — read-only calls only; writes go through execSafeCall)
 const CTF_ABI = [
     'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)',
@@ -53,25 +104,47 @@ const CTF_ABI = [
 ];
 
 /**
- * Check if a market has been resolved via Gamma API
+ * Check if a market has been resolved via Gamma API.
+ * Returns null if the market is not found (e.g. archived old markets).
  */
-async function checkMarketResolution(conditionId) {
+async function checkMarketResolution(conditionId, tokenId, position) {
     try {
-        const url = `${config.gammaHost}/markets?condition_id=${conditionId}`;
-        const response = await proxyFetch(url);
-        if (!response.ok) return null;
+        const url = `${config.gammaHost}/markets?clob_token_ids=${tokenId}`;
+        logger.info(`[Redeemer] checkMarketResolution → GET ${url}`);
+        const resp = await proxyFetch(url);
+        logger.info(`[Redeemer] API status: ${resp.status}`);
+        if (!resp.ok) {
+            logger.warn(`[Redeemer] API error ${resp.status} for tokenId ${tokenId}`);
+            return null;
+        }
+        const data = await resp.json();
+        logger.info(`[Redeemer] API response: ${JSON.stringify(data)}`);
+        const markets = Array.isArray(data) ? data : [];
 
-        const markets = await response.json();
-        if (!markets || markets.length === 0) return null;
+        // Empty → market archived after resolution
+        if (markets.length === 0) {
+            const ageMin = (Date.now() - new Date(position.createdAt).getTime()) / 60000;
+            logger.info(`[Redeemer] API returned empty [] — position age: ${ageMin.toFixed(1)}min`);
+            if (ageMin > 6) {
+                logger.info('[Redeemer] Market archived (empty response) and position >10min old → treating as resolved');
+                return { resolved: true, active: false, question: position.market };
+            }
+            return null;
+        }
 
         const market = markets[0];
-        return {
-            resolved: market.closed || market.resolved || false,
+        // Also treat as resolved if the market's end date has passed
+        const endDate = new Date(market.endDate ?? market.endTime ?? 0);
+        const isPastEnd = endDate.getTime() > 0 && Date.now() > endDate.getTime() + 60_000;
+        const result = {
+            resolved: market.closed === true || market.resolved === true || isPastEnd,
             active: market.active,
             question: market.question,
         };
+        logger.info(`[Redeemer] Resolution result: ${JSON.stringify(result)} | endDate: ${endDate.toISOString()} isPastEnd: ${isPastEnd}`);
+        return result;
     } catch (err) {
-        logger.error('Failed to check market resolution:', err.message);
+        logger.warn('[Redeemer] checkMarketResolution error: ' + err.message);
         return null;
     }
 }
@@ -82,20 +155,28 @@ async function checkMarketResolution(conditionId) {
  */
 async function checkOnChainPayout(conditionId) {
     try {
+        logger.info(`[Redeemer] checkOnChainPayout → conditionId: ${conditionId}`);
         const provider = await getPolygonProvider();
         const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, provider);
 
         const denominator = await ctf.payoutDenominator(conditionId);
-        if (denominator.isZero()) return { resolved: false, payouts: [] };
+        logger.info(`[Redeemer] payoutDenominator: ${denominator.toString()}`);
+        if (denominator.isZero()) {
+            logger.info(`[Redeemer] payoutDenominator is 0 — not yet resolved on-chain`);
+            return { resolved: false, payouts: [] };
+        }
 
         const payouts = [];
         for (let i = 0; i < 2; i++) {
             const numerator = await ctf.payoutNumerators(conditionId, i);
+            logger.info(`[Redeemer] payoutNumerators[${i}]: ${numerator.toString()}`);
             payouts.push(numerator.toNumber() / denominator.toNumber());
         }
 
+        logger.info(`[Redeemer] On-chain payouts: [YES=${payouts[0]}, NO=${payouts[1]}]`);
         return { resolved: true, payouts };
-    } catch {
+    } catch (err) {
+        logger.warn(`[Redeemer] checkOnChainPayout error: ${err.message}`);
         return { resolved: false, payouts: [] };
     }
 }
@@ -118,13 +199,15 @@ async function redeemPosition(conditionId) {
         ]);
 
         const label = conditionId.slice(0, 12) + '...';
-        logger.info(`Redeeming position: ${label}`);
+        logger.info(`[Redeemer] Calling redeemPositions on-chain for ${label}`);
+        logger.info(`[Redeemer] CTF_ADDRESS: ${CTF_ADDRESS} | USDC_ADDRESS: ${USDC_ADDRESS}`);
         const receipt = await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`);
         const txHash = receipt.transactionHash;
-        logger.success(`Redeemed in block ${receipt.blockNumber} | tx: ${txHash}`);
+        logger.success(`[Redeemer] Redeemed in block ${receipt.blockNumber} | tx: ${txHash}`);
         return txHash;
     } catch (err) {
-        logger.error(`Failed to redeem: ${err.message}`);
+        logger.error(`[Redeemer] redeemPosition FAILED for ${conditionId.slice(0, 12)}...: ${err.message}`);
+        logger.error(`[Redeemer] Full error: ${err.stack ?? err.message}`);
         return null;
     }
 }
@@ -182,18 +265,46 @@ export async function checkAndRedeemPositions() {
 
     for (const position of positions) {
         try {
+            logger.info(`[Redeemer] Processing: ${position.market.slice(0, 50)} | created: ${position.createdAt}`);
+
+            // Age of position in hours
+            const ageHours = (Date.now() - new Date(position.createdAt).getTime()) / 3_600_000;
+            logger.info(`[Redeemer] Position age: ${ageHours.toFixed(1)}h`);
+
             // 1. Quick check via Gamma API
-            const resolution = await checkMarketResolution(position.conditionId);
-            if (!resolution?.resolved) continue;
+            let resolution = null;
+            try {
+                resolution = await checkMarketResolution(position.conditionId, position.tokenId, position);
+            } catch (resErr) {
+                logger.warn(`[Redeemer] Resolution check error for ${position.market.slice(0, 40)}: ${resErr.message}`);
+            }
+            logger.info(`[Redeemer] API resolution: ${JSON.stringify(resolution)}`);
+
+            if (!resolution?.resolved) {
+                logger.info(`[Redeemer] Skipping — not resolved (age=${ageHours.toFixed(1)}h)`);
+                continue;
+            }
 
             logger.info(`[Redeemer] Market resolved: ${position.market}`);
 
             // 2. Verify on-chain payout is set before calling redeemPositions
             const onChain = await checkOnChainPayout(position.conditionId);
+            logger.info(`[Redeemer] On-chain result: resolved=${onChain.resolved} payouts=${JSON.stringify(onChain.payouts)}`);
             if (!onChain.resolved) {
-                logger.info(`[Redeemer] On-chain payout not set yet — will retry`);
+                const retries = (payoutRetryCount.get(position.conditionId) ?? 0) + 1;
+                payoutRetryCount.set(position.conditionId, retries);
+                // For very old positions (>24h) that are unresolvable on-chain, remove them
+                const maxRetries = ageHours >= 24 ? 3 : 20;
+                if (retries > maxRetries) {
+                    logger.warn(`[Redeemer] Position timed out after ${maxRetries} retries (age=${ageHours.toFixed(1)}h) — removing: ${position.market}`);
+                    removePosition(position.conditionId);
+                    payoutRetryCount.delete(position.conditionId);
+                } else {
+                    logger.info(`[Redeemer] On-chain payout not set yet — will retry (${retries}/${maxRetries})`);
+                }
                 continue;
             }
+            payoutRetryCount.delete(position.conditionId); // reset on success
 
             // 3. Simulate (dry-run) or execute real redeem
             if (config.dryRun) {
@@ -212,12 +323,13 @@ export async function checkAndRedeemPositions() {
                     let balance = null;
                     try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
                     if (pnl > 0) {
-                        notifyWin({ market: position.market, pnl, step: newState.step, totalPnl, balance });
+                        notifyWin({ market: position.market, pnl, step: newState.step, totalPnl, balance, txHash: null });
                         await checkTakeProfit(balance);
                     } else {
-                        notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance });
+                        notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance, totalPnl, txHash: null });
                         await checkStopLoss(balance);
                     }
+                    await updateCircuitBreakerOnOutcome(pnl > 0, position.market);
                 }
             } else {
                 const txHash = await redeemPosition(position.conditionId);
@@ -230,6 +342,19 @@ export async function checkAndRedeemPositions() {
                     removePosition(position.conditionId);
                     logger.money(`[Redeemer] Claimed: ${position.market} → ${returned.toFixed(4)} USDC`);
 
+                    // Store claim info for martingale-bot to merge into win/loss message
+                    try {
+                        fs.writeFileSync('data/last-claim.json', JSON.stringify({
+                            conditionId: position.conditionId,
+                            txHash,
+                            amount: returned,
+                            outcome: position.outcome,
+                            ts: new Date().toISOString(),
+                        }, null, 2));
+                    } catch (err) {
+                        logger.warn(`[Redeemer] Failed to write last-claim.json: ${err.message}`);
+                    }
+
                     const state    = loadMartingaleState();
                     const outcome  = pnl > 0 ? 'win' : 'loss';
                     const newState = registerOutcome(REDEEM_CFG, state, outcome, pnl, position.conditionId);
@@ -240,13 +365,13 @@ export async function checkAndRedeemPositions() {
                     let balance = null;
                     try { balance = await getUsdcBalance(); } catch { /* non-fatal */ }
                     if (pnl > 0) {
-                        notifyWin({ market: position.market, pnl, step: newState.step, totalPnl, balance });
+                        notifyWin({ market: position.market, pnl, step: newState.step, totalPnl, balance, txHash });
                         await checkTakeProfit(balance);
                     } else {
-                        notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance });
+                        notifyLoss({ market: position.market, pnl, newStep: newState.step, nextBet, balance, totalPnl, txHash });
                         await checkStopLoss(balance);
                     }
-                    notifyRedeem({ market: position.market, amount: returned, pnl, txHash });
+                    await updateCircuitBreakerOnOutcome(pnl > 0, position.market);
                 } else {
                     logger.warn(`[Redeemer] Redeem failed for ${position.market} — will retry`);
                 }
